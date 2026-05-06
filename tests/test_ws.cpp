@@ -13,8 +13,8 @@
 #include <thread>
 #include <vector>
 
-#include <plugins/links/ws/wire.hpp>
-#include <plugins/links/ws/ws.hpp>
+#include <wire.hpp>
+#include <ws.hpp>
 
 #include <sdk/host_api.h>
 #include <sdk/types.h>
