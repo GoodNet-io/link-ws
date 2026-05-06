@@ -31,6 +31,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -179,6 +180,7 @@ private:
 
     void register_session(gn_conn_id_t id, std::shared_ptr<Session> s);
     void erase_session(gn_conn_id_t id);
+    [[nodiscard]] bool claim_disconnect(gn_conn_id_t id);
     [[nodiscard]] std::shared_ptr<Session> find_session(gn_conn_id_t id) const;
 
     [[nodiscard]] static std::string endpoint_to_uri(
@@ -194,6 +196,13 @@ private:
 
     mutable std::mutex                                                  sessions_mu_;
     std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>>          sessions_;
+
+    /// Append-only record of every conn id ever registered via
+    /// register_session. shutdown() drains this through
+    /// notify_disconnect on the caller thread so each notify_connect
+    /// maps to one caller-thread notify_disconnect even when a worker
+    /// callback already emitted runtime disconnect on its own thread.
+    std::vector<gn_conn_id_t>                                           published_ids_;
 
     std::atomic<std::uint64_t> bytes_in_{0};
     std::atomic<std::uint64_t> bytes_out_{0};
