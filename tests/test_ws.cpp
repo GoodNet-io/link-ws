@@ -423,12 +423,13 @@ TEST(WsLink_PingFlood, ServerDisconnectsOnPongQueueOverflow) {
 
     /// The server publishes `notify_disconnect` when the next pong
     /// would overflow the cap. Both sides observe the disconnect on
-    /// the shared harness. The deadline is generous because the
-    /// test is timing-sensitive when the build host is loaded.
+    /// the shared harness. The deadline absorbs sanitiser slowdown
+    /// on a loaded kernel-suite run; the round-trip itself completes
+    /// in milliseconds when the host is idle.
     ASSERT_TRUE(wait_for([&]() {
         std::lock_guard lk(harness.mu);
         return !harness.disconnects.empty();
-    }, std::chrono::seconds{10}));
+    }, std::chrono::seconds{30}));
 
     client->shutdown();
     server->shutdown();
