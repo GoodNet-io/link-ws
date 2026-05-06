@@ -1,7 +1,9 @@
 # WebSocket link plugin unit tests — MIT.
 include(GoogleTest)
 
-add_executable(test_ws test_ws.cpp)
+add_executable(test_ws
+    test_ws.cpp
+    test_ws_conformance.cpp)
 target_link_libraries(test_ws PRIVATE
     GoodNet::sdk
     goodnet_ws_objects
