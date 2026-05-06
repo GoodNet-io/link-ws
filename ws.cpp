@@ -615,13 +615,10 @@ private:
         std::error_code ec;
         if (socket_.close(ec)) {}
         if (auto t = transport_.lock()) {
-            if (t->api_ && t->api_->notify_disconnect &&
-                conn_id_ != GN_INVALID_ID) {
+            if (conn_id_ != GN_INVALID_ID && t->claim_disconnect(conn_id_) &&
+                t->api_ && t->api_->notify_disconnect) {
                 t->api_->notify_disconnect(
                     t->api_->host_ctx, conn_id_, GN_OK);
-            }
-            if (conn_id_ != GN_INVALID_ID) {
-                t->erase_session(conn_id_);
             }
         }
     }
@@ -1049,27 +1046,19 @@ void WsLink::shutdown() {
     /// below runs on every call so a second `shutdown()` from a
     /// non-worker thread can finish the join that the first
     /// (worker-thread) call had to skip.
-    if (!shutdown_.exchange(true, std::memory_order_acq_rel)) {
-        if (acceptor_) {
-            std::error_code ec;
-            if (acceptor_->close(ec)) {}
-        }
-
-        /// Snapshot conn ids under the lock, post the per-session
-        /// close onto each session's strand, then notify the kernel
-        /// side SYNCHRONOUSLY for each session before stopping the
-        /// io_context. `ioc_.stop()` would otherwise drop pending
-        /// strand-bound continuations — including the read-
-        /// completion path that normally fires `notify_disconnect`.
-        /// Without sync notification, kernel-side
-        /// `ConnectionRegistry` keeps live records past ws shutdown,
-        /// which in turn keeps the security plugin's lifetime
-        /// anchor alive past the PluginManager drain budget. Per
-        /// `link.md` §9 the shutdown must release every kernel-
-        /// observable session before the io_context tear-down.
-        std::vector<gn_conn_id_t> live_ids;
-        {
-            std::lock_guard lk(sessions_mu_);
+    bool first_call = false;
+    std::vector<gn_conn_id_t> live_ids;
+    {
+        /// `shutdown_`'s atomic exchange is published under
+        /// `sessions_mu_` so a worker-thread `claim_disconnect` that
+        /// races with shutdown observes the flag under the same lock
+        /// and skips its own emit. Without the lock-bracketed
+        /// publish, the worker could erase a session between
+        /// shutdown's exchange and snapshot, dropping the kernel's
+        /// only release event for that conn (link.md §9 step 3).
+        std::lock_guard lk(sessions_mu_);
+        if (!shutdown_.exchange(true, std::memory_order_acq_rel)) {
+            first_call = true;
             live_ids.reserve(sessions_.size());
             for (auto& [id, s] : sessions_) {
                 live_ids.push_back(id);
@@ -1077,7 +1066,25 @@ void WsLink::shutdown() {
             }
             sessions_.clear();
         }
+    }
 
+    if (first_call) {
+        if (acceptor_) {
+            std::error_code ec;
+            if (acceptor_->close(ec)) {}
+        }
+
+        /// Notify the kernel side SYNCHRONOUSLY for each session
+        /// before stopping the io_context. `ioc_.stop()` would
+        /// otherwise drop pending strand-bound continuations —
+        /// including the read-completion path that normally fires
+        /// `notify_disconnect`. Without sync notification, kernel-
+        /// side `ConnectionRegistry` keeps live records past ws
+        /// shutdown, which in turn keeps the security plugin's
+        /// lifetime anchor alive past the PluginManager drain
+        /// budget. Per `link.md` §9 the shutdown must release every
+        /// kernel-observable session before the io_context tear-
+        /// down.
         if (api_ && api_->notify_disconnect) {
             for (const auto id : live_ids) {
                 (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
@@ -1107,6 +1114,12 @@ void WsLink::register_session(gn_conn_id_t id,
 void WsLink::erase_session(gn_conn_id_t id) {
     std::lock_guard lk(sessions_mu_);
     sessions_.erase(id);
+}
+
+bool WsLink::claim_disconnect(gn_conn_id_t id) {
+    std::lock_guard lk(sessions_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    return sessions_.erase(id) > 0;
 }
 
 std::shared_ptr<WsLink::Session>

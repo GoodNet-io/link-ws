@@ -179,6 +179,7 @@ private:
 
     void register_session(gn_conn_id_t id, std::shared_ptr<Session> s);
     void erase_session(gn_conn_id_t id);
+    [[nodiscard]] bool claim_disconnect(gn_conn_id_t id);
     [[nodiscard]] std::shared_ptr<Session> find_session(gn_conn_id_t id) const;
 
     [[nodiscard]] static std::string endpoint_to_uri(
