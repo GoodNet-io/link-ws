@@ -10,25 +10,24 @@ sees identical `notify_inbound_bytes` semantics on either scheme.
 
 ## Build
 
-In-tree, alongside the kernel:
+This plugin lives in its own git with a flake that pulls the
+kernel SDK as a Nix input. From this checkout:
 
 ```sh
-nix build .#goodnet-link-ws
-# result/lib/goodnet/plugins/libgoodnet_link_ws.so
+nix run .#build         # release build of libgoodnet_link_ws.so
+nix run .#test          # vanilla ctest
+nix run .#test-asan     # AddressSanitizer + UBSan
+nix run .#test-tsan     # ThreadSanitizer
 ```
 
-Standalone, against an installed kernel SDK:
-
-```sh
-cd plugins/links/ws
-cmake -B build -DCMAKE_PREFIX_PATH=/usr/local -DBUILD_TESTING=OFF
-cmake --build build
-```
+The kernel monorepo also builds this plugin in-tree through its
+own `nix run .#build -- release` — operator install consumes
+every bundled `.so` from there.
 
 ## Load
 
 Manifest entry pins the SHA-256 digest; `gn_plugin_init` registers
-the `ws` scheme. See `docs/install.md` and
+the `ws` scheme. See `docs/install.en.md` and
 `docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
 ## Contract
