@@ -29,8 +29,8 @@ cmake --build build
 
 Manifest entry pins the SHA-256 digest; `gn_plugin_init` registers
 the `ws` scheme. See `docs/install.md` and
-`docs/contracts/plugin-manifest.md` in the kernel tree.
+`docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
 ## Contract
 
-- Kernel-side link contract: `docs/contracts/link.md`
+- Kernel-side link contract: `docs/contracts/link.en.md`
