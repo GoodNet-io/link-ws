@@ -188,7 +188,14 @@ private:
 
     asio::io_context                                                 ioc_;
     asio::executor_work_guard<asio::io_context::executor_type>       work_;
-    std::thread                                                      worker_;
+    /// Multiple workers run the same `io_context`. Per-Session
+    /// strands serialise each connection's WebSocket frame I/O
+    /// (Boost.Beast is not thread-safe per-stream); the extra
+    /// threads add parallelism across connections. Teardown joins
+    /// every worker that is not the calling thread; if `shutdown()`
+    /// runs on a worker (ownership cycle in the caller), the
+    /// remaining workers are detached in the dtor with a warning.
+    std::vector<std::thread>                                         workers_;
 
     std::optional<asio::ip::tcp::acceptor> acceptor_;
     std::atomic<std::uint16_t>             listen_port_{0};

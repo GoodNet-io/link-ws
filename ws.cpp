@@ -649,7 +649,16 @@ private:
 WsLink::WsLink()
     : ioc_(),
       work_(asio::make_work_guard(ioc_)) {
-    worker_ = std::thread([this] { ioc_.run(); });
+    /// Worker pool sized symmetrically with the other link plugins.
+    /// Per-Session strands keep the per-conn Beast stream
+    /// single-threaded; the extra threads only run other
+    /// connections' work.
+    const unsigned hc = std::thread::hardware_concurrency();
+    const unsigned n  = std::max(1u, hc / 2);
+    workers_.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        workers_.emplace_back([this] { ioc_.run(); });
+    }
 }
 
 WsLink::~WsLink() {
@@ -668,23 +677,27 @@ WsLink::~WsLink() {
             gn_log_warn(api_, "ws: shutdown threw non-std exception");
         }
     }
-    /// `shutdown()` joins the worker on every call where the
-    /// caller is not the worker thread itself. A still-joinable
-    /// worker here means the dtor itself ran on the worker — an
-    /// ownership cycle in the caller (an async session handler is
-    /// holding the last `shared_ptr<WsLink>`). `ioc_.stop()` from
-    /// the shutdown call has already been issued so the worker is
-    /// on its way to exit; detach lets the dtor stay noexcept and
-    /// surfaces the violation through the host log for the caller
-    /// to fix.
-    if (worker_.joinable()) {
-        if (api_) {
-            gn_log_warn(api_,
-                "ws: dtor reached on worker thread "
-                "(ownership cycle in caller); detaching");
+    /// `shutdown()` joins every worker that is not the calling
+    /// thread. Any worker still joinable here means the dtor itself
+    /// ran on that worker — an ownership cycle in the caller (an
+    /// async session handler is holding the last
+    /// `shared_ptr<WsLink>`). `ioc_.stop()` from the shutdown call
+    /// has already been issued so the worker is on its way to exit;
+    /// detach lets the dtor stay noexcept and surfaces the violation
+    /// through the host log for the caller to fix.
+    bool warned = false;
+    for (auto& w : workers_) {
+        if (w.joinable()) {
+            if (api_ != nullptr && !warned) {
+                gn_log_warn(api_,
+                    "ws: dtor reached on worker thread "
+                    "(ownership cycle in caller); detaching");
+                warned = true;
+            }
+            w.detach();
         }
-        worker_.detach();
     }
+    workers_.clear();
 }
 
 void WsLink::set_host_api(const host_api_t* api) noexcept {
@@ -1112,13 +1125,15 @@ void WsLink::shutdown() {
         ioc_.stop();
     }
 
-    /// Join only when we're not the worker. Joining oneself
-    /// returns EDEADLK; the dtor catches a still-joinable thread
-    /// after `shutdown()` returns and surfaces it as an ownership-
-    /// cycle diagnostic.
-    if (worker_.joinable() &&
-        std::this_thread::get_id() != worker_.get_id()) {
-        worker_.join();
+    /// Join every worker that is not the calling thread. Joining
+    /// oneself returns EDEADLK; any worker that matches
+    /// `this_thread::get_id()` is left joinable for the dtor's
+    /// detach-with-warning path (ownership-cycle diagnostic).
+    for (auto& w : workers_) {
+        if (w.joinable() &&
+            std::this_thread::get_id() != w.get_id()) {
+            w.join();
+        }
     }
 }
 
