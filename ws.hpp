@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 /// @file   plugins/links/ws/ws.hpp
-/// @brief  RFC 6455 WebSocket transport (`ws://`).
+/// @brief  RFC 6455 WebSocket transport (`ws://`) — composer-mode.
 ///
-/// Plain WebSocket only. `wss://` is the same WS framing over a
-/// TLS-wrapped socket — once the `gn.link.tls` composer plugin
-/// ships, `wss://` URIs route through `tls + ws` rather than
-/// duplicating framing here. WS does not need its own security
-/// layer: the kernel's identity / Noise pipeline lives above the
-/// transport regardless of scheme.
+/// WS framing layered on top of a `gn.link.<scheme>` L1 carrier
+/// (today `tcp`; `tls` for the `wss://` slice). No own asio I/O —
+/// every byte hop goes through the carrier, the upgrade handshake
+/// runs as application bytes the carrier transports unchanged.
 ///
-/// Architecture mirrors TcpLink: own `asio::io_context` on a
-/// dedicated worker thread, strand-per-session writes serialise the
-/// single-writer invariant from `link.md` §4. The upgrade
-/// handshake parses HTTP/1.1 by hand — RFC 6455 §4 specifies a
-/// minimal subset: case-insensitive header names, `\r\n` line
-/// terminators, and exactly one mandatory `Sec-WebSocket-Key` /
-/// `Sec-WebSocket-Accept` exchange. We avoid pulling in a full HTTP
-/// library because the message set has fewer than ten observable
-/// shapes and a parser specialized to those is ~80 lines.
+/// The HTTP/1.1 upgrade specified by RFC 6455 §4 needs roughly ten
+/// observable header shapes; we parse those by hand (`~80 LOC byte
+/// state machine`) rather than pulling in a full HTTP library. After
+/// the `\r\n\r\n` boundary the same socket flips to WS frame
+/// framing — the carrier transports both phases identically.
+///
+/// `wss://` plugs into the same architecture by polarising the
+/// carrier scheme to `tls` when the URI's scheme is `wss`; framing,
+/// handshake, send-queue, and close discipline stay byte-for-byte
+/// identical because the carrier presents an opaque byte pipe in
+/// both cases.
 
 #pragma once
 
@@ -29,15 +29,11 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include <asio/executor_work_guard.hpp>
-#include <asio/io_context.hpp>
-#include <asio/ip/tcp.hpp>
-#include <asio/strand.hpp>
-
+#include <sdk/cpp/link_carrier.hpp>
+#include <sdk/cpp/uri.hpp>
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
 #include <sdk/trust.h>
@@ -71,10 +67,10 @@ public:
     /// layer that v1 explicitly does not own.
     [[nodiscard]] gn_result_t listen(std::string_view uri);
 
-    /// Initiate an outbound WebSocket connection. The TCP three-way
-    /// handshake plus the HTTP upgrade run on the worker thread; the
-    /// kernel learns of the established session through
-    /// `notify_connect` only after the upgrade response is parsed
+    /// Initiate an outbound WebSocket connection. The L1 carrier
+    /// connect plus the HTTP upgrade run on the carrier worker
+    /// thread; the kernel learns of the established session through
+    /// `notify_connect` only after the upgrade response parses
     /// successfully.
     [[nodiscard]] gn_result_t connect(std::string_view uri);
 
@@ -94,7 +90,7 @@ public:
         std::span<const std::span<const std::uint8_t>> frames);
 
     /// Idempotent close. Sends a graceful close frame (opcode 0x8)
-    /// before tearing down the TCP socket.
+    /// before tearing down the underlying carrier conn.
     [[nodiscard]] gn_result_t disconnect(gn_conn_id_t conn);
 
     void set_host_api(const host_api_t* api) noexcept;
@@ -121,11 +117,11 @@ public:
     /// `gn_limits_t::pending_queue_bytes_hard`.
     void set_pending_queue_bytes_hard_for_test(std::uint64_t bytes) noexcept;
 
-    /// Simulate a peer-initiated frame on @p conn by writing @p
-    /// bytes directly through the session's socket on the worker
-    /// strand. The receive path of the peer's session parses and
-    /// processes the frame as if it arrived over the wire. Used by
-    /// the regression suite for `backpressure.md` §3.1.
+    /// Simulate a peer-initiated frame on @p conn by pushing @p bytes
+    /// straight through the L1 carrier. The receive path of the peer's
+    /// session parses and processes the frame as if it arrived over
+    /// the wire. Used by the regression suite for `backpressure.md`
+    /// §3.1.
     [[nodiscard]] gn_result_t send_raw_for_test(
         gn_conn_id_t conn,
         std::span<const std::uint8_t> bytes);
@@ -137,29 +133,23 @@ public:
     /// protocol layer.
     static constexpr std::size_t kMaxFramePayload = 65536;
 
-    /// Parsed `ws://host:port[/path]` shape with a derived
-    /// `host_authority()` for the HTTP upgrade `Host:` header.
-    /// Public so the test suite can pin the bracket discipline
-    /// (RFC 7230 §5.4) without spinning up a live socket.
-    struct ParsedUri {
-        std::string host;
-        std::uint16_t port = 0;
-        std::string  path = "/";
-
-        /// `host:port` / `[v6]:port` form for the HTTP `Host:`
-        /// header (RFC 7230 §5.4). Mirrors
-        /// `gn::UriParts::host_authority`.
-        [[nodiscard]] std::string host_authority() const {
-            std::string s;
-            const bool is_v6 = host.find(':') != std::string::npos;
-            s.reserve(host.size() + 8);
-            if (is_v6) s += '[';
-            s += host;
-            if (is_v6) s += ']';
-            s += ':';
-            s += std::to_string(port);
-            return s;
-        }
+    /// Parsed `ws://host:port[/path]` or `wss://host:port[/path]`
+    /// shape. Inherits `host`, `port`, `scheme`, `host_authority()`
+    /// from `gn::UriParts` (no duplication); adds the WS-specific
+    /// `path` (HTTP resource path, e.g. `/foo`) and `secure` flag.
+    /// Public so the test suite can pin RFC 7230 §5.4 bracketing
+    /// without spinning up a live socket.
+    struct ParsedUri : public ::gn::UriParts {
+        /// HTTP resource path. Defaults to `/` per browser fallback
+        /// when the URI omits it. `UriParts::path` (parent) is the
+        /// ipc-style path slot and stays empty for `ws://` / `wss://`.
+        std::string http_path = "/";
+        /// `true` for `wss://`, `false` for `ws://`. Slice 6 carrier
+        /// polarisation reads this to choose between the
+        /// `gn.link.tcp` and `gn.link.tls` L1 carriers. Could be
+        /// derived from `scheme == "wss"` but kept as an explicit
+        /// field so call sites don't repeat the string compare.
+        bool secure = false;
     };
     [[nodiscard]] static std::optional<ParsedUri> parse_uri(
         std::string_view uri);
@@ -167,62 +157,79 @@ public:
 private:
     class Session;
 
-    /// Trust class derives from peer address: loopback addresses
-    /// surface as `Loopback`, everything else `Untrusted`. WSS
-    /// inherits the upgrade path through Noise.
-    [[nodiscard]] static gn_trust_class_t resolve_trust(
-        const asio::ip::tcp::endpoint& peer) noexcept;
+    /// Trust class for an inbound peer URI as the carrier reports
+    /// it. Loopback addresses surface as `Loopback`, everything
+    /// else `Untrusted`. WSS upgrades the byte stream through TLS at
+    /// the carrier layer; the upgrade above does not change the
+    /// trust derived from the L4 address.
+    [[nodiscard]] static gn_trust_class_t resolve_trust_from_uri(
+        std::string_view peer_uri) noexcept;
 
-    /// Re-arm the acceptor for the next inbound connection.
-    void start_accept();
-    void on_accept(std::shared_ptr<Session> session,
-                    const std::error_code& ec);
+    /// Convert a tcp/tls peer URI into the canonical ws/wss form so
+    /// the kernel's connection record matches the configured scheme.
+    [[nodiscard]] static std::string rewrite_peer_uri(
+        std::string_view carrier_peer_uri, bool secure);
 
-    void register_session(gn_conn_id_t id, std::shared_ptr<Session> s);
-    void erase_session(gn_conn_id_t id);
-    [[nodiscard]] bool claim_disconnect(gn_conn_id_t id);
-    [[nodiscard]] std::shared_ptr<Session> find_session(gn_conn_id_t id) const;
+    /// Bind the carrier matching @p secure on demand. Returns the
+    /// queried carrier scheme on success.
+    [[nodiscard]] gn_result_t ensure_carrier(bool secure);
 
-    [[nodiscard]] static std::string endpoint_to_uri(
-        const asio::ip::tcp::endpoint& ep, std::string_view path);
+    void compose_server_session(gn_conn_id_t l1,
+                                 std::string_view peer_uri);
 
-    asio::io_context                                                 ioc_;
-    asio::executor_work_guard<asio::io_context::executor_type>       work_;
-    /// Multiple workers run the same `io_context`. Per-Session
-    /// strands serialise each connection's WebSocket frame I/O
-    /// (Boost.Beast is not thread-safe per-stream); the extra
-    /// threads add parallelism across connections. Teardown joins
-    /// every worker that is not the calling thread; if `shutdown()`
-    /// runs on a worker (ownership cycle in the caller), the
-    /// remaining workers are detached in the dtor with a warning.
-    std::vector<std::thread>                                         workers_;
+    void register_session(gn_conn_id_t ws_id,
+                           std::shared_ptr<Session> s);
+    /// Atomic claim of a disconnect emission for @p ws_id. Mirrors the
+    /// TcpLink discipline: the session callback wins claim race when
+    /// `shutdown_` is unset, otherwise the caller-thread shutdown
+    /// drain owns the emission.
+    [[nodiscard]] bool claim_disconnect(gn_conn_id_t ws_id);
+    /// Drop the L1 ↔ WS association regardless of phase. Called from
+    /// session `fail()` paths so the next on_data lookup misses.
+    void drop_l1_mapping(gn_conn_id_t l1);
+    [[nodiscard]] std::shared_ptr<Session>
+    find_session_by_ws(gn_conn_id_t ws_id) const;
+    [[nodiscard]] std::shared_ptr<Session>
+    find_session_by_l1(gn_conn_id_t l1) const;
 
-    std::optional<asio::ip::tcp::acceptor> acceptor_;
-    std::atomic<std::uint16_t>             listen_port_{0};
-    std::atomic<bool>                      shutdown_{false};
+    std::atomic<bool> shutdown_{false};
 
-    mutable std::mutex                                                  sessions_mu_;
-    std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>>          sessions_;
+    mutable std::mutex sessions_mu_;
+    /// L1 (carrier) conn id → Session. Populated from the moment a
+    /// Session is created (handshake phase) until carrier disconnect.
+    std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>> by_l1_;
+    /// WS conn id (kernel-assigned via `notify_connect`) → Session.
+    /// Populated only after the handshake completes successfully.
+    std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>> by_ws_;
 
-    /// Append-only record of every conn id ever registered via
-    /// register_session. shutdown() drains this through
-    /// notify_disconnect on the caller thread so each notify_connect
-    /// maps to one caller-thread notify_disconnect even when a worker
-    /// callback already emitted runtime disconnect on its own thread.
-    std::vector<gn_conn_id_t>                                           published_ids_;
+    /// Append-only record of every ws_id ever registered through
+    /// `notify_connect`. `shutdown()` drains it through
+    /// `notify_disconnect` on the caller thread so each
+    /// `notify_connect` maps to exactly one caller-thread
+    /// `notify_disconnect` even when a worker already emitted the
+    /// release on its own thread (`link.md` §9 step 3).
+    std::vector<gn_conn_id_t> published_ids_;
 
     std::atomic<std::uint64_t> bytes_in_{0};
     std::atomic<std::uint64_t> bytes_out_{0};
     std::atomic<std::uint64_t> frames_in_{0};
     std::atomic<std::uint64_t> frames_out_{0};
 
-    /// Per-connection write-queue thresholds per `backpressure.md`
-    /// §1.
-    std::uint64_t pending_queue_bytes_low_  = 0;
-    std::uint64_t pending_queue_bytes_high_ = 0;
+    /// Per-connection hard cap on outbound WS frame size — the
+    /// `backpressure.md` §3.1 control-reply abuse protection. With the
+    /// composer-mode refactor the WS layer no longer owns a write
+    /// queue (the carrier does); we still bound a single emitted
+    /// frame's size so a peer cannot drive arbitrarily large echoes.
     std::uint64_t pending_queue_bytes_hard_ = 0;
 
     const host_api_t* api_ = nullptr;
+
+    /// L1 carrier handle, queried lazily on first listen / connect.
+    /// The scheme is fixed for the lifetime of the handle: a WsLink
+    /// instance speaks either ws-over-tcp or wss-over-tls, never both
+    /// concurrently. Slice 6 picks the scheme at URI parse time.
+    std::optional<gn::sdk::LinkCarrier> carrier_;
+    bool carrier_secure_ = false;
 };
 
 } // namespace gn::link::ws

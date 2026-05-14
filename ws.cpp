@@ -1,711 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
 /// @file   plugins/links/ws/ws.cpp
-/// @brief  Implementation of the RFC 6455 WebSocket transport.
+/// @brief  Composer-mode WebSocket transport — RFC 6455 framing
+///         layered on a `gn.link.<scheme>` L1 carrier (today `tcp`,
+///         later `tls` for `wss://`).
 
 #include "ws.hpp"
 
 #include "wire.hpp"
+#include "ws_http_parse.hpp"
+#include "ws_session.hpp"
 
 #include <sdk/convenience.h>
 #include <sdk/cpp/dns.hpp>
 #include <sdk/cpp/uri.hpp>
 
-#include <asio/bind_executor.hpp>
-#include <asio/buffer.hpp>
-#include <asio/connect.hpp>
-#include <asio/dispatch.hpp>
-#include <asio/ip/v6_only.hpp>
-#include <asio/read.hpp>
-#include <asio/write.hpp>
+#include <asio/io_context.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
-#include <deque>
 #include <random>
 #include <span>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace gn::link::ws {
 
-namespace {
-
-/// Generate 16 random bytes, base64-encode → `Sec-WebSocket-Key`
-/// per RFC 6455 §1.3. The bytes are not security-sensitive (the
-/// kernel's identity / Noise layer above does that work); a
-/// thread-local Mersenne-Twister suffices for uniqueness across
-/// outstanding outbound connections.
-std::string make_sec_websocket_key() {
-    thread_local std::mt19937 rng{std::random_device{}()};
-    std::array<std::uint8_t, 16> bytes{};
-    for (auto& b : bytes) b = static_cast<std::uint8_t>(rng());
-    return wire::base64_encode(
-        std::span<const std::uint8_t>(bytes.data(), bytes.size()));
-}
-
-/// 32-bit random seed for masking. Same rationale: not security
-/// critical, the kernel encrypts above us.
-std::uint32_t make_mask_seed() {
-    thread_local std::mt19937 rng{std::random_device{}()};
-    return static_cast<std::uint32_t>(rng());
-}
-
-bool iequals(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::string_view trim(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
-    while (!s.empty() && (s.back()  == ' ' || s.back()  == '\t')) s.remove_suffix(1);
-    return s;
-}
-
-struct ParsedRequest {
-    std::string method;
-    std::string target;
-    std::unordered_map<std::string, std::string> headers;
-};
-
-std::optional<ParsedRequest> parse_http_request(std::string_view raw) {
-    /// Walk the buffer line by line, consuming up to "\r\n\r\n".
-    /// The minimum a valid WS upgrade carries is request-line +
-    /// `Host:` + `Upgrade: websocket` + `Connection: Upgrade` +
-    /// `Sec-WebSocket-Key:` + `Sec-WebSocket-Version: 13`. We
-    /// accept any header order.
-    ParsedRequest pr;
-    std::size_t pos = 0;
-    auto next_line = [&]() -> std::optional<std::string_view> {
-        const auto crlf = raw.find("\r\n", pos);
-        if (crlf == std::string_view::npos) return std::nullopt;
-        const auto line = raw.substr(pos, crlf - pos);
-        pos = crlf + 2;
-        return line;
-    };
-
-    auto request_line = next_line();
-    if (!request_line) return std::nullopt;
-    auto sp1 = request_line->find(' ');
-    if (sp1 == std::string_view::npos) return std::nullopt;
-    auto sp2 = request_line->find(' ', sp1 + 1);
-    if (sp2 == std::string_view::npos) return std::nullopt;
-    pr.method = std::string{request_line->substr(0, sp1)};
-    pr.target = std::string{request_line->substr(sp1 + 1, sp2 - sp1 - 1)};
-
-    while (true) {
-        auto line = next_line();
-        if (!line) return std::nullopt;
-        if (line->empty()) break;
-        const auto colon = line->find(':');
-        if (colon == std::string_view::npos) continue;
-        std::string name{trim(line->substr(0, colon))};
-        std::string value{trim(line->substr(colon + 1))};
-        std::transform(name.begin(), name.end(), name.begin(),
-            [](unsigned char ch) { return std::tolower(ch); });
-        pr.headers[std::move(name)] = std::move(value);
-    }
-    return pr;
-}
-
-struct ParsedResponse {
-    int status = 0;
-    std::unordered_map<std::string, std::string> headers;
-};
-
-std::optional<ParsedResponse> parse_http_response(std::string_view raw) {
-    ParsedResponse pr;
-    std::size_t pos = 0;
-    auto next_line = [&]() -> std::optional<std::string_view> {
-        const auto crlf = raw.find("\r\n", pos);
-        if (crlf == std::string_view::npos) return std::nullopt;
-        const auto line = raw.substr(pos, crlf - pos);
-        pos = crlf + 2;
-        return line;
-    };
-
-    auto status_line = next_line();
-    if (!status_line) return std::nullopt;
-    /// "HTTP/1.1 101 Switching Protocols"
-    auto sp1 = status_line->find(' ');
-    if (sp1 == std::string_view::npos) return std::nullopt;
-    auto sp2 = status_line->find(' ', sp1 + 1);
-    if (sp2 == std::string_view::npos) return std::nullopt;
-    const auto code_sv = status_line->substr(sp1 + 1, sp2 - sp1 - 1);
-    pr.status = 0;
-    for (auto ch : code_sv) {
-        if (ch < '0' || ch > '9') return std::nullopt;
-        pr.status = pr.status * 10 + (ch - '0');
-    }
-
-    while (true) {
-        auto line = next_line();
-        if (!line) return std::nullopt;
-        if (line->empty()) break;
-        const auto colon = line->find(':');
-        if (colon == std::string_view::npos) continue;
-        std::string name{trim(line->substr(0, colon))};
-        std::string value{trim(line->substr(colon + 1))};
-        std::transform(name.begin(), name.end(), name.begin(),
-            [](unsigned char ch) { return std::tolower(ch); });
-        pr.headers[std::move(name)] = std::move(value);
-    }
-    return pr;
-}
-
-} // namespace
-
-// ── Session ──────────────────────────────────────────────────────────────
-
-class WsLink::Session : public std::enable_shared_from_this<Session> {
-public:
-    enum class Mode { Server, Client };
-    enum class Phase { Handshake, Frames, Closed };
-
-    Session(asio::ip::tcp::socket sock,
-            std::weak_ptr<WsLink> t,
-            Mode mode)
-        : socket_(std::move(sock)),
-          strand_(asio::make_strand(socket_.get_executor())),
-          transport_(std::move(t)),
-          mode_(mode) {}
-
-    void start_server_handshake() {
-        phase_ = Phase::Handshake;
-        do_read_handshake();
-    }
-
-    void start_client_handshake(const std::string& host_header,
-                                 const std::string& path) {
-        phase_      = Phase::Handshake;
-        nonce_      = make_sec_websocket_key();
-        /// HTTP request-line injection gate. The path is interpolated
-        /// verbatim into `GET <path> HTTP/1.1\r\n`; a path containing
-        /// CR / LF / NUL would let an attacker terminate the
-        /// request line early and smuggle additional headers — the
-        /// classic HTTP request-smuggling shape on a WebSocket
-        /// upgrade. Reject and fail before writing any bytes.
-        for (const char c : path) {
-            if (c == '\r' || c == '\n' || c == '\0') {
-                fail();
-                return;
-            }
-        }
-        for (const char c : host_header) {
-            if (c == '\r' || c == '\n' || c == '\0') {
-                fail();
-                return;
-            }
-        }
-        std::ostringstream req;
-        req << "GET " << path << " HTTP/1.1\r\n"
-            << "Host: " << host_header << "\r\n"
-            << "Upgrade: websocket\r\n"
-            << "Connection: Upgrade\r\n"
-            << "Sec-WebSocket-Key: " << nonce_ << "\r\n"
-            << "Sec-WebSocket-Version: 13\r\n\r\n";
-        const std::string s = req.str();
-        auto buf = std::make_shared<std::vector<std::uint8_t>>(
-            s.begin(), s.end());
-        asio::async_write(socket_, asio::buffer(*buf),
-            asio::bind_executor(strand_,
-                [self = shared_from_this(), buf](
-                    const std::error_code& ec, std::size_t) {
-                    if (ec) {
-                        self->fail();
-                        return;
-                    }
-                    self->do_read_handshake();
-                }));
-    }
-
-    void enqueue_send(std::span<const std::uint8_t> payload) {
-        auto frame = std::make_shared<std::vector<std::uint8_t>>(
-            wire::build_binary_frame(payload,
-                /*mask=*/mode_ == Mode::Client,
-                make_mask_seed()));
-        const auto added = frame->size();
-        const auto post = bytes_buffered_.fetch_add(
-            added, std::memory_order_relaxed) + added;
-        maybe_signal_soft(post);
-        asio::dispatch(strand_,
-            [self = shared_from_this(), frame]() mutable {
-                self->write_queue_.push_back(std::move(frame));
-                self->maybe_start_write();
-            });
-    }
-
-    [[nodiscard]] std::uint64_t bytes_buffered() const noexcept {
-        return bytes_buffered_.load(std::memory_order_relaxed);
-    }
-
-    void maybe_signal_soft(std::uint64_t post) {
-        auto t = transport_.lock();
-        if (!t) return;
-        if (t->pending_queue_bytes_high_ == 0) return;
-        if (post <= t->pending_queue_bytes_high_) return;
-        bool expected = false;
-        if (!soft_signaled_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel)) {
-            return;
-        }
-        if (t->api_ && t->api_->notify_backpressure) {
-            (void)t->api_->notify_backpressure(
-                t->api_->host_ctx, conn_id_,
-                GN_CONN_EVENT_BACKPRESSURE_SOFT, post);
-        }
-    }
-    void maybe_signal_clear(std::uint64_t post) {
-        auto t = transport_.lock();
-        if (!t) return;
-        if (t->pending_queue_bytes_low_ == 0) return;
-        if (post >= t->pending_queue_bytes_low_) return;
-        bool expected = true;
-        if (!soft_signaled_.compare_exchange_strong(
-                expected, false, std::memory_order_acq_rel)) {
-            return;
-        }
-        if (t->api_ && t->api_->notify_backpressure) {
-            (void)t->api_->notify_backpressure(
-                t->api_->host_ctx, conn_id_,
-                GN_CONN_EVENT_BACKPRESSURE_CLEAR, post);
-        }
-    }
-
-    /// Test-only: write @p data straight onto the wire as if the
-    /// peer had emitted those bytes. The receive path on the other
-    /// end parses the bytes through the normal frame loop. Used by
-    /// the regression suite for `backpressure.md` §3.1; production
-    /// code never invokes this.
-    void send_raw_for_test(
-        const std::shared_ptr<std::vector<std::uint8_t>>& data) {
-        asio::async_write(socket_, asio::buffer(*data),
-            asio::bind_executor(strand_,
-                [self = shared_from_this(), data](
-                    const std::error_code&, std::size_t) {
-                    /// Test-only path; errors do not propagate.
-                }));
-    }
-
-    void enqueue_close() {
-        auto frame = std::make_shared<std::vector<std::uint8_t>>(
-            wire::build_close_frame(/*mask=*/mode_ == Mode::Client,
-                                    make_mask_seed()));
-        asio::dispatch(strand_,
-            [self = shared_from_this(), frame]() mutable {
-                if (self->phase_ == Phase::Closed) return;
-                /// Per backpressure.md §3.1: host-initiated close
-                /// frames follow the same drop-on-overflow rule as
-                /// peer-echoed close frames. The socket teardown
-                /// below carries the closure regardless of whether
-                /// the wire-level frame went out.
-                auto t = self->transport_.lock();
-                const auto hard_cap =
-                    t ? t->pending_queue_bytes_hard_ : 0U;
-                const auto current = self->bytes_buffered_.load(
-                    std::memory_order_relaxed);
-                if (hard_cap == 0 ||
-                    current + frame->size() <= hard_cap) {
-                    self->bytes_buffered_.fetch_add(
-                        frame->size(), std::memory_order_relaxed);
-                    self->write_queue_.push_back(std::move(frame));
-                    self->maybe_start_write();
-                }
-                self->phase_ = Phase::Closed;
-                std::error_code ec;
-                if (self->socket_.shutdown(
-                        asio::ip::tcp::socket::shutdown_send, ec)) {}
-            });
-    }
-
-    void set_conn_id(gn_conn_id_t id) { conn_id_ = id; }
-    [[nodiscard]] gn_conn_id_t conn_id() const noexcept { return conn_id_; }
-    [[nodiscard]] asio::ip::tcp::socket& socket() noexcept { return socket_; }
-
-private:
-    void do_read_handshake() {
-        socket_.async_read_some(
-            asio::buffer(read_buf_),
-            asio::bind_executor(strand_,
-                [self = shared_from_this()](
-                    const std::error_code& ec, std::size_t n) {
-                    if (ec) { self->fail(); return; }
-                    self->handshake_buf_.append(
-                        reinterpret_cast<const char*>(self->read_buf_.data()),
-                        n);
-                    /// Cap to avoid a peer feeding us megabytes of
-                    /// header lines; 8 KiB is the de facto HTTP
-                    /// header budget.
-                    if (self->handshake_buf_.size() > 8192) {
-                        self->fail();
-                        return;
-                    }
-                    if (self->handshake_buf_.find("\r\n\r\n") ==
-                        std::string::npos) {
-                        self->do_read_handshake();
-                        return;
-                    }
-                    if (self->mode_ == Mode::Server) {
-                        self->finish_server_handshake();
-                    } else {
-                        self->finish_client_handshake();
-                    }
-                }));
-    }
-
-    void finish_server_handshake() {
-        auto req = parse_http_request(handshake_buf_);
-        if (!req || req->method != "GET") { fail(); return; }
-        const auto find = [&](std::string_view name) -> const std::string* {
-            auto it = req->headers.find(std::string{name});
-            return it == req->headers.end() ? nullptr : &it->second;
-        };
-        const auto upgrade    = find("upgrade");
-        const auto connection = find("connection");
-        const auto key        = find("sec-websocket-key");
-        const auto version    = find("sec-websocket-version");
-        if (!upgrade || !connection || !key || !version) { fail(); return; }
-        if (!iequals(*upgrade, "websocket"))           { fail(); return; }
-        if (connection->find("Upgrade") == std::string::npos &&
-            connection->find("upgrade") == std::string::npos) {
-            fail(); return;
-        }
-        if (*version != "13") { fail(); return; }
-
-        const auto accept_value = wire::handshake_accept(*key);
-        std::ostringstream resp;
-        resp << "HTTP/1.1 101 Switching Protocols\r\n"
-             << "Upgrade: websocket\r\n"
-             << "Connection: Upgrade\r\n"
-             << "Sec-WebSocket-Accept: " << accept_value << "\r\n\r\n";
-        const std::string s = resp.str();
-        auto buf = std::make_shared<std::vector<std::uint8_t>>(
-            s.begin(), s.end());
-        handshake_buf_.clear();
-        asio::async_write(socket_, asio::buffer(*buf),
-            asio::bind_executor(strand_,
-                [self = shared_from_this(), buf](
-                    const std::error_code& ec, std::size_t) {
-                    if (ec) { self->fail(); return; }
-                    self->open_session(GN_ROLE_RESPONDER);
-                }));
-    }
-
-    void finish_client_handshake() {
-        auto resp = parse_http_response(handshake_buf_);
-        if (!resp || resp->status != 101) { fail(); return; }
-        auto it = resp->headers.find("sec-websocket-accept");
-        if (it == resp->headers.end()) { fail(); return; }
-        if (it->second != wire::handshake_accept(nonce_)) { fail(); return; }
-        handshake_buf_.clear();
-        open_session(GN_ROLE_INITIATOR);
-    }
-
-    void open_session(gn_handshake_role_t role) {
-        auto t = transport_.lock();
-        if (!t) { fail(); return; }
-
-        if (!t->api_ || !t->api_->notify_connect) {
-            fail();
-            return;
-        }
-
-        const auto peer = socket_.remote_endpoint();
-        const auto trust = WsLink::resolve_trust(peer);
-        const auto uri = WsLink::endpoint_to_uri(peer, "/");
-        gn_conn_id_t id = GN_INVALID_ID;
-        if (t->api_->notify_connect(t->api_->host_ctx,
-                                     /*remote_pk=*/nullptr,
-                                     uri.c_str(),
-                                     trust, role, &id) != GN_OK) {
-            fail();
-            return;
-        }
-        conn_id_ = id;
-        t->register_session(id, shared_from_this());
-
-        if (role == GN_ROLE_INITIATOR && t->api_->kick_handshake) {
-            (void)t->api_->kick_handshake(t->api_->host_ctx, id);
-        }
-
-        phase_ = Phase::Frames;
-        do_read_frame();
-    }
-
-    void do_read_frame() {
-        socket_.async_read_some(
-            asio::buffer(read_buf_),
-            asio::bind_executor(strand_,
-                [self = shared_from_this()](
-                    const std::error_code& ec, std::size_t n) {
-                    if (ec) { self->fail(); return; }
-                    auto t = self->transport_.lock();
-                    if (!t) return;
-                    t->bytes_in_.fetch_add(n, std::memory_order_relaxed);
-                    self->frame_buf_.insert(self->frame_buf_.end(),
-                        self->read_buf_.data(),
-                        self->read_buf_.data() + n);
-                    self->dispatch_frames();
-                    if (self->phase_ != Phase::Closed) {
-                        self->do_read_frame();
-                    }
-                }));
-    }
-
-    void dispatch_frames() {
-        while (true) {
-            auto header = wire::parse_frame_header(
-                std::span<const std::uint8_t>(
-                    frame_buf_.data(), frame_buf_.size()));
-            if (!header) return;
-            const std::size_t total = header->header_size + header->payload_len;
-            if (frame_buf_.size() < total) return;
-
-            const auto hdr_ofs =
-                static_cast<std::ptrdiff_t>(header->header_size);
-            const auto total_ofs = static_cast<std::ptrdiff_t>(total);
-            std::vector<std::uint8_t> payload(
-                frame_buf_.begin() + hdr_ofs,
-                frame_buf_.begin() + total_ofs);
-            frame_buf_.erase(frame_buf_.begin(),
-                              frame_buf_.begin() + total_ofs);
-
-            /// Server-from-client frames MUST be masked; client-from
-            /// -server frames MUST NOT be (RFC 6455 §5.1). Either
-            /// violation is a protocol error.
-            if (mode_ == Mode::Server && !header->masked) { fail(); return; }
-            if (mode_ == Mode::Client &&  header->masked) { fail(); return; }
-            if (header->masked) {
-                wire::apply_mask(
-                    std::span<std::uint8_t>(payload.data(), payload.size()),
-                    header->mask);
-            }
-
-            auto t = transport_.lock();
-            if (!t) return;
-            t->frames_in_.fetch_add(1, std::memory_order_relaxed);
-
-            switch (header->opcode) {
-                case 0x0:  // continuation
-                case 0x1:  // text — treated as binary at the byte level
-                case 0x2:  // binary
-                    if (!header->fin) {
-                        /// Defer fragmented messages until v1.1; the
-                        /// kernel's protocol layer caps frames anyway
-                        /// so legitimate peers stay under one frame.
-                        fail();
-                        return;
-                    }
-                    if (t->api_ && t->api_->notify_inbound_bytes) {
-                        const gn_result_t rc =
-                            t->api_->notify_inbound_bytes(
-                                t->api_->host_ctx, conn_id_,
-                                payload.data(), payload.size());
-                        if (rc == GN_OK) {
-                            host_api_failures_.store(
-                                0, std::memory_order_relaxed);
-                        } else {
-                            const auto fails =
-                                host_api_failures_.fetch_add(
-                                    1, std::memory_order_relaxed) + 1;
-                            if (fails >= 16) {
-                                fail();
-                                return;
-                            }
-                        }
-                    }
-                    break;
-                case 0x8: {  // close
-                    /// Mirror back, then tear down. Idempotent if we
-                    /// already initiated close.
-                    if (phase_ == Phase::Frames) {
-                        auto reply = std::make_shared<std::vector<std::uint8_t>>(
-                            wire::build_close_frame(
-                                mode_ == Mode::Client, make_mask_seed()));
-                        /// Per backpressure.md §3.1: control replies
-                        /// share the per-connection hard cap. If the
-                        /// queue is already at the cap when the peer
-                        /// asks to close, drop the echo — the socket
-                        /// teardown below carries the closure signal
-                        /// regardless.
-                        const auto hard_cap = t->pending_queue_bytes_hard_;
-                        const auto current = bytes_buffered_.load(
-                            std::memory_order_relaxed);
-                        if (hard_cap == 0 ||
-                            current + reply->size() <= hard_cap) {
-                            bytes_buffered_.fetch_add(
-                                reply->size(), std::memory_order_relaxed);
-                            write_queue_.push_back(std::move(reply));
-                            maybe_start_write();
-                        }
-                    }
-                    phase_ = Phase::Closed;
-                    return;
-                }
-                case 0x9: {  // ping
-                    auto pong = std::make_shared<std::vector<std::uint8_t>>(
-                        wire::build_pong_frame(
-                            std::span<const std::uint8_t>(
-                                payload.data(), payload.size()),
-                            mode_ == Mode::Client, make_mask_seed()));
-                    /// Per backpressure.md §3.1: a control flood is
-                    /// abuse, not production traffic. If echoing the
-                    /// pong would push the queue past the hard cap,
-                    /// disconnect rather than amplify the buffer.
-                    const auto hard_cap = t->pending_queue_bytes_hard_;
-                    const auto current = bytes_buffered_.load(
-                        std::memory_order_relaxed);
-                    if (hard_cap != 0 &&
-                        current + pong->size() > hard_cap) {
-                        fail();
-                        return;
-                    }
-                    bytes_buffered_.fetch_add(
-                        pong->size(), std::memory_order_relaxed);
-                    write_queue_.push_back(std::move(pong));
-                    maybe_start_write();
-                    break;
-                }
-                case 0xA:  // pong — no kernel signal
-                    break;
-                default:
-                    fail();
-                    return;
-            }
-        }
-    }
-
-    void maybe_start_write() {
-        if (write_in_flight_ || write_queue_.empty()) return;
-        write_in_flight_ = true;
-        auto buf = write_queue_.front();
-        const std::size_t buf_size = buf->size();
-        asio::async_write(socket_, asio::buffer(*buf),
-            asio::bind_executor(strand_,
-                [self = shared_from_this(), buf, buf_size](
-                    const std::error_code& ec, std::size_t n) {
-                    self->write_queue_.pop_front();
-                    self->write_in_flight_ = false;
-                    const auto post = self->bytes_buffered_.fetch_sub(
-                        buf_size, std::memory_order_relaxed) - buf_size;
-                    self->maybe_signal_clear(post);
-                    auto t = self->transport_.lock();
-                    if (!t) return;
-                    if (ec) { self->fail(); return; }
-                    t->bytes_out_.fetch_add(n, std::memory_order_relaxed);
-                    /// Count the frame emission, not every chunk.
-                    t->frames_out_.fetch_add(1, std::memory_order_relaxed);
-                    self->maybe_start_write();
-                }));
-    }
-
-    void fail() {
-        if (phase_ == Phase::Closed) return;
-        phase_ = Phase::Closed;
-        std::error_code ec;
-        if (socket_.close(ec)) {}
-        if (auto t = transport_.lock()) {
-            if (conn_id_ != GN_INVALID_ID && t->claim_disconnect(conn_id_) &&
-                t->api_ && t->api_->notify_disconnect) {
-                t->api_->notify_disconnect(
-                    t->api_->host_ctx, conn_id_, GN_OK);
-            }
-        }
-    }
-
-    asio::ip::tcp::socket                              socket_;
-    asio::strand<asio::any_io_executor>                strand_;
-    std::weak_ptr<WsLink>                        transport_;
-    Mode                                                mode_;
-    Phase                                               phase_ = Phase::Handshake;
-
-    gn_conn_id_t                                        conn_id_ = GN_INVALID_ID;
-    std::array<std::uint8_t, 4096>                      read_buf_{};
-    std::string                                         handshake_buf_;
-    std::vector<std::uint8_t>                           frame_buf_;
-    std::deque<std::shared_ptr<std::vector<std::uint8_t>>> write_queue_;
-    bool                                                write_in_flight_ = false;
-    std::atomic<std::uint64_t>                          bytes_buffered_{0};
-    std::atomic<bool>                                   soft_signaled_{false};
-    std::string                                         nonce_;
-    /// Consecutive non-OK results from `notify_inbound_bytes`;
-    /// 16 in a row triggers `fail()` so a peer that floods the
-    /// security layer with garbage cannot keep the conn alive.
-    std::atomic<std::uint32_t>                          host_api_failures_{0};
-};
+/// `Session`, helper trio (`make_sec_websocket_key`, `make_mask_seed`,
+/// `iequals`), and HTTP/1.1 request / response parsers live in
+/// `ws_session.hpp` + `ws_http_parse.hpp`. The header-only forms
+/// stay inline so this TU pays nothing for the move beyond two
+/// extra `#include`s.
 
 // ── WsLink ───────────────────────────────────────────────────────────────
 
-WsLink::WsLink()
-    : ioc_(),
-      work_(asio::make_work_guard(ioc_)) {
-    /// Worker pool sized symmetrically with the other link plugins.
-    /// Per-Session strands keep the per-conn Beast stream
-    /// single-threaded; the extra threads only run other
-    /// connections' work.
-    const unsigned hc = std::thread::hardware_concurrency();
-    const unsigned n  = std::max(1u, hc / 2);
-    workers_.reserve(n);
-    for (unsigned i = 0; i < n; ++i) {
-        workers_.emplace_back([this] { ioc_.run(); });
-    }
-}
+WsLink::WsLink() = default;
 
 WsLink::~WsLink() {
-    /// The dtor must stay noexcept. `shutdown()` walks the strand
-    /// dispatch chain, which can throw `bad_executor` once the
-    /// io_context has torn down; surface through the host log if
-    /// available, otherwise drop on the floor.
     try {
         shutdown();
     } catch (const std::exception& e) {
         if (api_) {
             gn_log_warn(api_, "ws: shutdown threw: %s", e.what());
         }
-    } catch (...) {
-        if (api_) {
-            gn_log_warn(api_, "ws: shutdown threw non-std exception");
-        }
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // dtor stays noexcept; non-std exceptions silently swallowed.
     }
-    /// `shutdown()` joins every worker that is not the calling
-    /// thread. Any worker still joinable here means the dtor itself
-    /// ran on that worker — an ownership cycle in the caller (an
-    /// async session handler is holding the last
-    /// `shared_ptr<WsLink>`). `ioc_.stop()` from the shutdown call
-    /// has already been issued so the worker is on its way to exit;
-    /// detach lets the dtor stay noexcept and surfaces the violation
-    /// through the host log for the caller to fix.
-    bool warned = false;
-    for (auto& w : workers_) {
-        if (w.joinable()) {
-            if (api_ != nullptr && !warned) {
-                gn_log_warn(api_,
-                    "ws: dtor reached on worker thread "
-                    "(ownership cycle in caller); detaching");
-                warned = true;
-            }
-            w.detach();
-        }
-    }
-    workers_.clear();
 }
 
 void WsLink::set_host_api(const host_api_t* api) noexcept {
     api_ = api;
     if (api_ != nullptr && api_->limits != nullptr) {
         if (const auto* L = api_->limits(api_->host_ctx); L != nullptr) {
-            pending_queue_bytes_low_  = L->pending_queue_bytes_low;
-            pending_queue_bytes_high_ = L->pending_queue_bytes_high;
             pending_queue_bytes_hard_ = L->pending_queue_bytes_hard;
         }
     }
@@ -719,21 +70,19 @@ void WsLink::set_pending_queue_bytes_hard_for_test(
 gn_result_t WsLink::send_raw_for_test(
     gn_conn_id_t conn,
     std::span<const std::uint8_t> bytes) {
-    auto s = find_session(conn);
+    auto s = find_session_by_ws(conn);
     if (!s) return GN_ERR_NOT_FOUND;
-    auto data = std::make_shared<std::vector<std::uint8_t>>(
-        bytes.begin(), bytes.end());
-    s->send_raw_for_test(data);
-    return GN_OK;
+    return s->send_raw(bytes);
 }
 
 std::uint16_t WsLink::listen_port() const noexcept {
-    return listen_port_.load(std::memory_order_acquire);
+    if (!carrier_) return 0;
+    return carrier_->listen_port();
 }
 
 std::size_t WsLink::session_count() const noexcept {
     std::lock_guard lk(sessions_mu_);
-    return sessions_.size();
+    return by_ws_.size();
 }
 
 WsLink::Stats WsLink::stats() const noexcept {
@@ -755,268 +104,264 @@ gn_link_caps_t WsLink::capabilities() noexcept {
     return c;
 }
 
-gn_trust_class_t WsLink::resolve_trust(
-    const asio::ip::tcp::endpoint& peer) noexcept {
-    if (peer.address().is_loopback()) return GN_TRUST_LOOPBACK;
+gn_trust_class_t WsLink::resolve_trust_from_uri(
+    std::string_view peer_uri) noexcept {
+    /// The carrier's peer URI is the canonical L1 form,
+    /// `tcp://host:port` / `tls://host:port`. Strip the scheme prefix
+    /// and check for loopback literals; everything else is
+    /// `Untrusted` per `link.md` §3 — trust upgrades to `Peer` after
+    /// Noise completes above us.
+    const auto colon = peer_uri.find("://");
+    const auto host_start = colon == std::string_view::npos
+        ? std::size_t{0} : colon + 3;
+    std::string_view rest = peer_uri.substr(host_start);
+    /// Trim trailing `:port` portion to leave a bare host literal.
+    /// IPv6 literals come wrapped in `[...]`; loopback we accept
+    /// is the unwrapped form `::1`.
+    if (!rest.empty() && rest.front() == '[') {
+        const auto close = rest.find(']');
+        if (close == std::string_view::npos) return GN_TRUST_UNTRUSTED;
+        rest = rest.substr(1, close - 1);
+    } else {
+        const auto last_colon = rest.rfind(':');
+        if (last_colon != std::string_view::npos) {
+            rest = rest.substr(0, last_colon);
+        }
+    }
+    if (rest == "127.0.0.1" || rest == "::1") return GN_TRUST_LOOPBACK;
+    if (rest.starts_with("127.")) return GN_TRUST_LOOPBACK;
     return GN_TRUST_UNTRUSTED;
+}
+
+std::string WsLink::rewrite_peer_uri(
+    std::string_view carrier_peer_uri, bool secure) {
+    /// `tcp://host:port` → `ws://host:port`; `tls://host:port` →
+    /// `wss://host:port`. The canonical kernel-facing scheme stays
+    /// consistent with the WS public URI form even though the L1
+    /// underneath is a different scheme.
+    const auto colon = carrier_peer_uri.find("://");
+    if (colon == std::string_view::npos) {
+        return std::string{carrier_peer_uri};
+    }
+    std::string out;
+    out.reserve(carrier_peer_uri.size());
+    out += secure ? "wss" : "ws";
+    out.append(carrier_peer_uri.substr(colon));
+    return out;
 }
 
 std::optional<WsLink::ParsedUri> WsLink::parse_uri(
     std::string_view uri) {
-    /// Plain WebSocket only — `wss://` is the same WebSocket protocol
-    /// over a TLS-wrapped underlying socket and lands once the
-    /// `gn.link.tls` composer plugin ships. The composer model
-    /// keeps WS framing in this plugin and TLS encryption in its
-    /// own; nothing changes about the framing on the wire.
-    constexpr std::string_view kWs = "ws://";
-    if (!uri.starts_with(kWs)) return std::nullopt;
-
+    /// Accept both `ws://` (plain) and `wss://` (TLS-tunnelled).
     /// `gn::parse_uri` handles bracket-IPv6, port parsing, and
     /// scheme stripping but does not split authority from a path
-    /// suffix. Strip the WebSocket resource path here so the
-    /// shared parser sees a clean `ws://authority` slice and the
-    /// path travels separately into the upgrade handshake.
-    auto rest = uri.substr(kWs.size());
+    /// suffix. Strip the WebSocket resource path here so the shared
+    /// parser sees a clean `<scheme>://authority` slice and the path
+    /// travels separately into the upgrade handshake.
+    constexpr std::string_view kWs  = "ws://";
+    constexpr std::string_view kWss = "wss://";
+    bool secure = false;
+    std::string_view scheme_prefix;
+    if (uri.starts_with(kWss)) {
+        secure = true;
+        scheme_prefix = kWss;
+    } else if (uri.starts_with(kWs)) {
+        scheme_prefix = kWs;
+    } else {
+        return std::nullopt;
+    }
+
+    auto rest = uri.substr(scheme_prefix.size());
     std::string path;
     if (const auto slash = rest.find('/'); slash != std::string_view::npos) {
         path.assign(rest.substr(slash));
         rest = rest.substr(0, slash);
     }
     std::string canonical;
-    canonical.reserve(kWs.size() + rest.size());
-    canonical.append(kWs);
+    canonical.reserve(scheme_prefix.size() + rest.size());
+    canonical.append(scheme_prefix);
     canonical.append(rest);
 
     const auto parts = ::gn::parse_uri(canonical);
-    if (!parts || parts->scheme != "ws" || parts->is_path_style()) {
-        return std::nullopt;
-    }
+    if (!parts || parts->is_path_style()) return std::nullopt;
+    if (!secure && parts->scheme != "ws")  return std::nullopt;
+    if (secure  && parts->scheme != "wss") return std::nullopt;
     if (parts->host.empty()) return std::nullopt;
+
+    /// `ParsedUri` inherits the canonical authority/scheme fields
+    /// from `gn::UriParts`; copy the parent slice through and add
+    /// the WS-specific `http_path` + `secure` on top. A `ws://host:0`
+    /// URI on listen means "ephemeral port"; the connect-side caller
+    /// asserts `port != 0` separately.
     ParsedUri pr;
-    pr.host = parts->host;
-    /// A `ws://host:0` URI on listen means "ephemeral port"; the
-    /// connect-side caller asserts `port != 0` separately.
-    pr.port = parts->port;
-    pr.path = path.empty() ? std::string{"/"} : std::move(path);
+    static_cast<::gn::UriParts&>(pr) = *parts;
+    pr.http_path = path.empty() ? std::string{"/"} : std::move(path);
+    pr.secure    = secure;
     return pr;
 }
 
-std::string WsLink::endpoint_to_uri(
-    const asio::ip::tcp::endpoint& ep, std::string_view path) {
-    std::ostringstream s;
-    s << "ws://";
-    if (ep.address().is_v6()) {
-        s << '[' << ep.address().to_string() << ']';
-    } else {
-        s << ep.address().to_string();
+gn_result_t WsLink::ensure_carrier(bool secure) {
+    if (carrier_) {
+        if (carrier_secure_ != secure) {
+            gn_log_warn(api_, "ws: ensure_carrier scheme conflict — "
+                              "carrier already bound to %s but "
+                              "request wants %s",
+                        carrier_secure_ ? "tls" : "tcp",
+                        secure ? "tls" : "tcp");
+            return GN_ERR_INVALID_STATE;
+        }
+        return GN_OK;
     }
-    s << ':' << ep.port() << path;
-    return s.str();
+    if (!api_) return GN_ERR_INVALID_STATE;
+    const std::string_view scheme = secure ? "tls" : "tcp";
+    auto opt = gn::sdk::LinkCarrier::query(api_, scheme);
+    if (!opt) {
+        gn_log_warn(api_, "ws: ensure_carrier query gn.link.%.*s "
+                          "extension missing — load the carrier plugin "
+                          "before ws://wss://",
+                    static_cast<int>(scheme.size()), scheme.data());
+        return GN_ERR_NOT_FOUND;
+    }
+    carrier_.emplace(std::move(*opt));
+    carrier_secure_ = secure;
+    return GN_OK;
 }
 
 gn_result_t WsLink::listen(std::string_view uri) {
     auto parsed = parse_uri(uri);
-    if (!parsed) return GN_ERR_INVALID_ENVELOPE;
-
-    asio::ip::tcp::endpoint ep;
-    try {
-        if (parsed->host == "0.0.0.0" || parsed->host == "::") {
-            ep = asio::ip::tcp::endpoint(
-                parsed->host == "::" ? asio::ip::tcp::v6() : asio::ip::tcp::v4(),
-                parsed->port);
-        } else {
-            ep = asio::ip::tcp::endpoint(
-                asio::ip::make_address(parsed->host), parsed->port);
-        }
-    } catch (...) {
+    if (!parsed) {
+        gn_log_warn(api_, "ws: listen reject malformed uri %.*s "
+                          "(expected ws:// or wss://)",
+                    static_cast<int>(uri.size()), uri.data());
         return GN_ERR_INVALID_ENVELOPE;
     }
-
-    std::error_code ec;
-    asio::ip::tcp::acceptor acc(ioc_);
-    if (acc.open(ep.protocol(), ec)) {
-        if (api_) {
-            gn_log_warn(api_,
-                "ws: acceptor open failed (uri=%.*s, errno=%d): %s",
-                static_cast<int>(uri.size()), uri.data(),
-                ec.value(), ec.message().c_str());
-        }
-        return GN_ERR_NULL_ARG;
+    if (const auto rc = ensure_carrier(parsed->secure); rc != GN_OK) {
+        return rc;
     }
-    /// IPv6 wildcard `::` — disable `IPV6_V6ONLY` so dual-stack
-    /// listens accept v4-mapped clients on Linux. Best-effort:
-    /// pre-Linux-3.x kernels lack the option and the connection
-    /// stays v4-only. Specific v6 literals stay v6-only by default.
-    if (ep.address().is_v6() && ep.address().is_unspecified()) {
-        std::error_code v6_ec;
-        // NOLINTNEXTLINE(bugprone-unused-return-value,cert-err33-c)
-        acc.set_option(asio::ip::v6_only(false), v6_ec);
-        if (v6_ec && api_) {
-            gn_log_debug(api_, "ws: v6_only(false) failed: %s",
-                         v6_ec.message().c_str());
-        }
-    }
-    if (acc.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec)) {
-        if (api_) {
-            gn_log_warn(api_,
-                "ws: reuse_address failed (uri=%.*s, errno=%d): %s",
-                static_cast<int>(uri.size()), uri.data(),
-                ec.value(), ec.message().c_str());
-        }
-        return GN_ERR_LIMIT_REACHED;
-    }
-    if (acc.bind(ep, ec)) {
-        if (api_) {
-            gn_log_warn(api_,
-                "ws: bind failed (uri=%.*s, errno=%d): %s",
-                static_cast<int>(uri.size()), uri.data(),
-                ec.value(), ec.message().c_str());
-        }
-        return GN_ERR_LIMIT_REACHED;
-    }
-    if (acc.listen(asio::socket_base::max_listen_connections, ec)) {
-        if (api_) {
-            gn_log_warn(api_,
-                "ws: listen failed (uri=%.*s, errno=%d): %s",
-                static_cast<int>(uri.size()), uri.data(),
-                ec.value(), ec.message().c_str());
-        }
-        return GN_ERR_LIMIT_REACHED;
-    }
-    listen_port_.store(acc.local_endpoint().port(),
-                        std::memory_order_release);
-    acceptor_.emplace(std::move(acc));
-    start_accept();
-    return GN_OK;
+    auto self_weak = weak_from_this();
+    const auto rc = carrier_->on_accept(
+        [self_weak](gn_conn_id_t l1, std::string_view peer_uri) {
+            if (auto t = self_weak.lock()) {
+                t->compose_server_session(l1, peer_uri);
+            }
+        });
+    if (rc != GN_OK) return rc;
+    std::string l1_uri;
+    l1_uri.reserve(parsed->host.size() + 16);
+    l1_uri += parsed->secure ? "tls://" : "tcp://";
+    l1_uri += parsed->host;
+    l1_uri += ':';
+    l1_uri += std::to_string(parsed->port);
+    return carrier_->listen(l1_uri);
 }
 
-void WsLink::start_accept() {
-    if (shutdown_.load(std::memory_order_acquire) || !acceptor_) return;
-
-    /// Build the Session up front so its socket is constructed
-    /// against the io_context before async_accept binds to it.
+void WsLink::compose_server_session(gn_conn_id_t l1,
+                                     std::string_view peer_uri) {
+    auto self = shared_from_this();
     auto session = std::make_shared<Session>(
-        asio::ip::tcp::socket(ioc_),
-        weak_from_this(),
-        Session::Mode::Server);
-    if (!acceptor_.has_value()) return;
-    auto& sock = session->socket();
-    /// Async accept holds a weak observer of the transport
-    /// (`plugin-lifetime.md` §4) so a queued completion never
-    /// extends the transport past its kernel-side lifetime.
-    acceptor_->async_accept(sock,
-        [weak = weak_from_this(),
-         session = std::move(session)](const std::error_code& ec) mutable {
-            auto self = weak.lock();
-            if (!self) return;
-            if (self->shutdown_.load(std::memory_order_acquire)) return;
-            if (ec) { self->start_accept(); return; }
-            /// Disable Nagle: WS pings, pongs, and small framed
-            /// app messages must not wait on the kernel's
-            /// coalescing timer. Best-effort.
-            std::error_code nodelay_ec;
-            // NOLINTNEXTLINE(bugprone-unused-return-value,cert-err33-c)
-            session->socket().set_option(
-                asio::ip::tcp::no_delay{true}, nodelay_ec);
-            if (nodelay_ec && self->api_) {
-                gn_log_debug(self->api_, "ws: TCP_NODELAY refused: %s",
-                             nodelay_ec.message().c_str());
+        weak_from_this(), l1, Session::Mode::Server);
+    session->peer_uri_ =
+        rewrite_peer_uri(peer_uri, carrier_secure_);
+    session->trust_    = resolve_trust_from_uri(peer_uri);
+    {
+        std::lock_guard lk(sessions_mu_);
+        if (shutdown_.load(std::memory_order_acquire)) return;
+        by_l1_[l1] = session;
+    }
+    if (!carrier_) return;
+    std::weak_ptr<Session> sess_weak = session;
+    (void)carrier_->on_data(l1,
+        [sess_weak](gn_conn_id_t /*conn*/,
+                    std::span<const std::uint8_t> bytes) {
+            if (auto s = sess_weak.lock()) {
+                s->feed_inbound(bytes);
             }
-            session->start_server_handshake();
-            self->start_accept();
         });
 }
 
 gn_result_t WsLink::connect(std::string_view uri) {
-    /// Hostname → IP literal up-front per `dns.md` §1; the helper
-    /// short-circuits IP-literal hosts. The HTTP `Host:` header sent
-    /// during the upgrade carries the literal `host:port`, matching
-    /// the registry key the kernel will use.
-    auto resolved = ::gn::sdk::resolve_uri_host(ioc_, uri);
-    if (!resolved) return GN_ERR_INVALID_ENVELOPE;
-
-    auto parsed = parse_uri(*resolved);
-    if (!parsed) return GN_ERR_INVALID_ENVELOPE;
-
-    asio::ip::tcp::endpoint ep;
-    try {
-        ep = asio::ip::tcp::endpoint(
-            asio::ip::make_address(parsed->host), parsed->port);
-    } catch (const std::exception&) {
+    /// One-shot io_context for the synchronous DNS resolve below.
+    /// WS no longer owns an io_context for I/O — the carrier does —
+    /// but the resolver helper still demands one for the asio
+    /// `resolver` instance. Stack-scoped, destroyed before we hand
+    /// off to the carrier.
+    asio::io_context resolver_ioc;
+    auto resolved = ::gn::sdk::resolve_uri_host(resolver_ioc, uri);
+    if (!resolved) {
+        gn_log_warn(api_, "ws: connect DNS resolve failed for %.*s",
+                    static_cast<int>(uri.size()), uri.data());
         return GN_ERR_INVALID_ENVELOPE;
     }
 
-    /// `host_authority()` re-brackets IPv6 literals per RFC 7230
-    /// §5.4 — strict servers (nginx, Caddy) reject `Host: ::1:9000`.
+    auto parsed = parse_uri(*resolved);
+    if (!parsed) {
+        gn_log_warn(api_, "ws: connect reject malformed resolved uri "
+                          "%.*s (expected ws:// or wss://)",
+                    static_cast<int>(resolved->size()), resolved->data());
+        return GN_ERR_INVALID_ENVELOPE;
+    }
+    if (const auto rc = ensure_carrier(parsed->secure); rc != GN_OK) {
+        return rc;
+    }
+
+    std::string l1_uri;
+    l1_uri.reserve(parsed->host.size() + 16);
+    l1_uri += parsed->secure ? "tls://" : "tcp://";
+    l1_uri += parsed->host;
+    l1_uri += ':';
+    l1_uri += std::to_string(parsed->port);
+
+    gn_conn_id_t l1 = GN_INVALID_ID;
+    if (!carrier_) return GN_ERR_INVALID_STATE;
+    const auto rc = carrier_->connect(l1_uri, &l1);
+    if (rc != GN_OK) {
+        if (api_) {
+            gn_log_warn(api_,
+                "ws: carrier connect failed (uri=%.*s, rc=%d)",
+                static_cast<int>(uri.size()), uri.data(),
+                static_cast<int>(rc));
+        }
+        return rc;
+    }
     auto session = std::make_shared<Session>(
-        asio::ip::tcp::socket(ioc_),
-        weak_from_this(),
-        Session::Mode::Client);
-    auto& sock = session->socket();
-    sock.async_connect(ep,
-        [weak = weak_from_this(),
-         session,
-         host = parsed->host_authority(),
-         path = parsed->path](const std::error_code& cec) {
-            if (cec) {
-                /// Connect failed before any `notify_connect` could
-                /// publish — kernel has no record to release, so
-                /// the diagnostic is operator-facing only. Without
-                /// the warn, the outbound URI sat in the WS log
-                /// silently; per `link.md` §9 a connect failure is
-                /// not a session release event but still must be
-                /// observable.
-                if (auto t = weak.lock(); t && t->api_) {
-                    gn_log_warn(t->api_,
-                        "ws: connect to %s failed: %s",
-                        host.c_str(), cec.message().c_str());
-                }
-                return;
+        weak_from_this(), l1, Session::Mode::Client);
+    /// For the client side the canonical scheme'd URI is the public
+    /// one the caller asked for, so the kernel record stays
+    /// consistent across both ends.
+    session->peer_uri_ = std::string{*resolved};
+    session->trust_ = GN_TRUST_UNTRUSTED;
+    {
+        std::lock_guard lk(sessions_mu_);
+        if (shutdown_.load(std::memory_order_acquire)) {
+            (void)carrier_->disconnect(l1);
+            return GN_ERR_INVALID_STATE;
+        }
+        by_l1_[l1] = session;
+    }
+    std::weak_ptr<Session> sess_weak = session;
+    (void)carrier_->on_data(l1,
+        [sess_weak](gn_conn_id_t /*conn*/,
+                    std::span<const std::uint8_t> bytes) {
+            if (auto s = sess_weak.lock()) {
+                s->feed_inbound(bytes);
             }
-            /// Disable Nagle on the outbound side, mirroring the
-            /// accept path. Best-effort.
-            std::error_code nodelay_ec;
-            // NOLINTNEXTLINE(bugprone-unused-return-value,cert-err33-c)
-            session->socket().set_option(
-                asio::ip::tcp::no_delay{true}, nodelay_ec);
-            (void)nodelay_ec;
-            session->start_client_handshake(host, path);
         });
+    session->start_client_handshake(parsed->host_authority(),
+                                      parsed->http_path);
     return GN_OK;
 }
 
 gn_result_t WsLink::send(gn_conn_id_t conn,
-                                std::span<const std::uint8_t> bytes) {
+                          std::span<const std::uint8_t> bytes) {
     if (bytes.size() > kMaxFramePayload) return GN_ERR_PAYLOAD_TOO_LARGE;
-    auto s = find_session(conn);
+    auto s = find_session_by_ws(conn);
     if (!s) return GN_ERR_NOT_FOUND;
-    /// Account against the framed wire size — header overhead +
-    /// payload — so the cap mirrors what actually sits in
-    /// `write_queue_`.
-    const auto framed = bytes.size() + 14U;
-    if (pending_queue_bytes_hard_ != 0 &&
-        s->bytes_buffered() + framed > pending_queue_bytes_hard_) {
-        if (api_) {
-            if (api_->emit_counter) {
-                api_->emit_counter(api_->host_ctx, "drop.queue_hard_cap");
-            }
-            gn_log_warn(api_,
-                "ws.send: queue hard cap — conn=%llu buffered=%zu add=%zu hard=%zu",
-                static_cast<unsigned long long>(conn),
-                s->bytes_buffered(),
-                framed,
-                pending_queue_bytes_hard_);
-        }
-        return GN_ERR_LIMIT_REACHED;
-    }
-    s->enqueue_send(bytes);
-    return GN_OK;
+    return s->enqueue_send(bytes);
 }
 
 gn_result_t WsLink::send_batch(
     gn_conn_id_t conn,
     std::span<const std::span<const std::uint8_t>> frames) {
-    /// Coalesce into one logical message — single-writer invariant.
     std::size_t total = 0;
     for (const auto& f : frames) total += f.size();
     if (total > kMaxFramePayload) return GN_ERR_PAYLOAD_TOO_LARGE;
@@ -1025,141 +370,98 @@ gn_result_t WsLink::send_batch(
     for (const auto& f : frames) {
         coalesced.insert(coalesced.end(), f.begin(), f.end());
     }
-    auto s = find_session(conn);
+    auto s = find_session_by_ws(conn);
     if (!s) return GN_ERR_NOT_FOUND;
-    const auto framed = total + 14U;
-    if (pending_queue_bytes_hard_ != 0 &&
-        s->bytes_buffered() + framed > pending_queue_bytes_hard_) {
-        if (api_) {
-            if (api_->emit_counter) {
-                api_->emit_counter(api_->host_ctx, "drop.queue_hard_cap");
-            }
-            gn_log_warn(api_,
-                "ws.send_batch: queue hard cap — conn=%llu buffered=%zu add=%zu hard=%zu",
-                static_cast<unsigned long long>(conn),
-                s->bytes_buffered(),
-                framed,
-                pending_queue_bytes_hard_);
-        }
-        return GN_ERR_LIMIT_REACHED;
-    }
-    s->enqueue_send(std::span<const std::uint8_t>(coalesced));
-    return GN_OK;
+    return s->enqueue_send(
+        std::span<const std::uint8_t>(coalesced));
 }
 
 gn_result_t WsLink::disconnect(gn_conn_id_t conn) {
-    auto s = find_session(conn);
+    auto s = find_session_by_ws(conn);
     if (!s) return GN_OK;
     s->enqueue_close();
     return GN_OK;
 }
 
 void WsLink::shutdown() {
-    /// Side-effect block runs only on the first call. The join
-    /// below runs on every call so a second `shutdown()` from a
-    /// non-worker thread can finish the join that the first
-    /// (worker-thread) call had to skip.
-    ///
-    /// Drain every ever-published conn id through notify_disconnect
-    /// on the caller thread before stopping the io_context. The
-    /// append-only `published_ids_` log captures every id the worker
-    /// announced via `notify_connect`; `sessions_` is just the live
-    /// socket map and may already be empty if a worker callback
-    /// raced ahead of shutdown and erased its session. Without this
-    /// drain a worker that emitted disconnect on its own thread
-    /// before shutdown ran would leave zero caller-thread emits and
-    /// break the `notify_connect → notify_disconnect on shutdown
-    /// caller thread` invariant from `link.md` §9 step 3.
-    ///
-    /// The kernel resolves the resulting double-emit through
-    /// `GN_ERR_NOT_FOUND` (see `core/kernel/host_api_builder.cpp`
-    /// `thunk_notify_disconnect`): the second call observes the
-    /// already-erased registry record and returns without re-firing
-    /// `DISCONNECTED`, so the redundant emit is benign.
-    ///
-    /// `shutdown_.exchange(true)` runs INSIDE the lock so a worker
-    /// callback racing with shutdown either (a) wins the lock
-    /// first, sees `shutdown_=false`, claims its id, and emits on
-    /// the worker thread, or (b) loses, sees `shutdown_=true`, and
-    /// bails — the drain below then carries the kernel-observable
-    /// release on the caller thread either way.
+    /// `shutdown_.exchange(true)` runs INSIDE the lock so worker
+    /// callbacks (carrier data-bus invocations) racing with shutdown
+    /// either (a) win the lock, see `shutdown_=false`, claim their id,
+    /// and emit on the worker thread, or (b) lose, see
+    /// `shutdown_=true`, and bail — the drain below then carries the
+    /// kernel-observable release on the caller thread either way. The
+    /// kernel resolves the resulting double-emit through
+    /// `GN_ERR_NOT_FOUND` (`host_api_builder.cpp` thunk_notify_disconnect).
     bool first_call = false;
     std::vector<gn_conn_id_t> ids_to_emit;
+    std::vector<std::shared_ptr<Session>> sessions_to_close;
     {
         std::lock_guard lk(sessions_mu_);
         if (!shutdown_.exchange(true, std::memory_order_acq_rel)) {
             first_call = true;
             ids_to_emit = std::move(published_ids_);
             published_ids_.clear();
-            for (auto& [id, s] : sessions_) {
-                s->enqueue_close();
+            sessions_to_close.reserve(by_l1_.size());
+            for (auto& [l1, s] : by_l1_) {
+                sessions_to_close.push_back(s);
             }
-            sessions_.clear();
+            by_l1_.clear();
+            by_ws_.clear();
+        }
+    }
+    if (!first_call) return;
+
+    for (auto& s : sessions_to_close) {
+        s->enqueue_close();
+    }
+    sessions_to_close.clear();
+
+    /// Notify the kernel side SYNCHRONOUSLY for each published session
+    /// before dropping the carrier. The carrier dtor unsubscribes
+    /// data + accept callbacks so no further worker-thread events can
+    /// fire; without sync notification, kernel-side
+    /// `ConnectionRegistry` keeps live records past WS shutdown.
+    if (api_ && api_->notify_disconnect) {
+        for (const auto id : ids_to_emit) {
+            (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
         }
     }
 
-    if (first_call) {
-        if (acceptor_) {
-            std::error_code ec;
-            if (acceptor_->close(ec)) {}
-        }
-
-        /// Notify the kernel side SYNCHRONOUSLY for each session
-        /// before stopping the io_context. `ioc_.stop()` would
-        /// otherwise drop pending strand-bound continuations —
-        /// including the read-completion path that normally fires
-        /// `notify_disconnect`. Without sync notification, kernel-
-        /// side `ConnectionRegistry` keeps live records past ws
-        /// shutdown, which in turn keeps the security plugin's
-        /// lifetime anchor alive past the PluginManager drain
-        /// budget. Per `link.md` §9 the shutdown must release every
-        /// kernel-observable session before the io_context tear-
-        /// down.
-        if (api_ && api_->notify_disconnect) {
-            for (const auto id : ids_to_emit) {
-                (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
-            }
-        }
-
-        work_.reset();
-        ioc_.stop();
-    }
-
-    /// Join every worker that is not the calling thread. Joining
-    /// oneself returns EDEADLK; any worker that matches
-    /// `this_thread::get_id()` is left joinable for the dtor's
-    /// detach-with-warning path (ownership-cycle diagnostic).
-    for (auto& w : workers_) {
-        if (w.joinable() &&
-            std::this_thread::get_id() != w.get_id()) {
-            w.join();
-        }
-    }
+    /// Release the carrier handle — RAII unsubscribes every data /
+    /// accept callback the WsLink installed.
+    carrier_.reset();
 }
 
-void WsLink::register_session(gn_conn_id_t id,
-                                     std::shared_ptr<Session> s) {
+void WsLink::register_session(gn_conn_id_t ws_id,
+                               std::shared_ptr<Session> s) {
     std::lock_guard lk(sessions_mu_);
-    sessions_.emplace(id, std::move(s));
-    published_ids_.push_back(id);
+    by_ws_[ws_id] = std::move(s);
+    published_ids_.push_back(ws_id);
 }
 
-void WsLink::erase_session(gn_conn_id_t id) {
-    std::lock_guard lk(sessions_mu_);
-    sessions_.erase(id);
-}
-
-bool WsLink::claim_disconnect(gn_conn_id_t id) {
+bool WsLink::claim_disconnect(gn_conn_id_t ws_id) {
     std::lock_guard lk(sessions_mu_);
     if (shutdown_.load(std::memory_order_acquire)) return false;
-    return sessions_.erase(id) > 0;
+    return by_ws_.erase(ws_id) > 0;
+}
+
+void WsLink::drop_l1_mapping(gn_conn_id_t l1) {
+    std::lock_guard lk(sessions_mu_);
+    by_l1_.erase(l1);
 }
 
 std::shared_ptr<WsLink::Session>
-WsLink::find_session(gn_conn_id_t id) const {
+WsLink::find_session_by_ws(gn_conn_id_t ws_id) const {
     std::lock_guard lk(sessions_mu_);
-    auto it = sessions_.find(id);
-    return it == sessions_.end() ? nullptr : it->second;
+    auto it = by_ws_.find(ws_id);
+    return it == by_ws_.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<WsLink::Session>
+WsLink::find_session_by_l1(gn_conn_id_t l1) const {
+    std::lock_guard lk(sessions_mu_);
+    auto it = by_l1_.find(l1);
+    return it == by_l1_.end() ? nullptr : it->second;
 }
 
 } // namespace gn::link::ws
