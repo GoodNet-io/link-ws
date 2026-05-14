@@ -144,7 +144,7 @@ public:
         /// when the URI omits it. `UriParts::path` (parent) is the
         /// ipc-style path slot and stays empty for `ws://` / `wss://`.
         std::string http_path = "/";
-        /// `true` for `wss://`, `false` for `ws://`. Slice 6 carrier
+        /// `true` for `wss://`, `false` for `ws://`. Carrier
         /// polarisation reads this to choose between the
         /// `gn.link.tcp` and `gn.link.tls` L1 carriers. Could be
         /// derived from `scheme == "wss"` but kept as an explicit
@@ -227,7 +227,7 @@ private:
     /// L1 carrier handle, queried lazily on first listen / connect.
     /// The scheme is fixed for the lifetime of the handle: a WsLink
     /// instance speaks either ws-over-tcp or wss-over-tls, never both
-    /// concurrently. Slice 6 picks the scheme at URI parse time.
+    /// concurrently. The scheme is picked at URI parse time.
     std::optional<gn::sdk::LinkCarrier> carrier_;
     bool carrier_secure_ = false;
 };
