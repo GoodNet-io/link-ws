@@ -130,6 +130,13 @@ gn_trust_class_t WsLink::resolve_trust_from_uri(
     }
     if (rest == "127.0.0.1" || rest == "::1") return GN_TRUST_LOOPBACK;
     if (rest.starts_with("127.")) return GN_TRUST_LOOPBACK;
+    /// IPv4-mapped IPv6 loopback — a v4 client connecting through a
+    /// dual-stack v6 listener arrives as `::ffff:127.x.x.x`. Without
+    /// this branch the trust resolver classifies the connection as
+    /// `Untrusted` even though the underlying address is loopback,
+    /// which makes test fixtures that drive a v6 acceptor flake on
+    /// the trust-class assertion.
+    if (rest.starts_with("::ffff:127.")) return GN_TRUST_LOOPBACK;
     return GN_TRUST_UNTRUSTED;
 }
 
