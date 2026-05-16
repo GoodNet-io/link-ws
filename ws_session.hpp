@@ -388,13 +388,21 @@ private:
                             host_api_failures_.store(
                                 0, std::memory_order_relaxed);
                         } else if (rc == GN_ERR_LIMIT_REACHED) {
-                            /// Receiver-side backpressure — the kernel
-                            /// session's recv buffer is momentarily full.
-                            /// Match the TCP sibling
-                            /// (`tcp.cpp:96-118`) and treat this as
-                            /// transient rather than counting toward
-                            /// the 16-failure disconnect; a stalled-recv
-                            /// park retry is the follow-up (B-LINKS-06).
+                            /// Receiver-side backpressure — kernel
+                            /// session's recv buffer momentarily full.
+                            /// LIMIT_REACHED stays excluded from the
+                            /// 16-failure disconnect counter (treated
+                            /// as transient). The full stalled-recv
+                            /// park that TCP / IPC / TLS carry does
+                            /// not map cleanly here — WS dispatches
+                            /// inside the carrier's callback without
+                            /// its own strand, so retry plumbing
+                            /// would have to thread through carrier
+                            /// pause / resume semantics. The carrier
+                            /// underneath (TCP or TLS via the IPC
+                            /// stalled-recv park) already absorbs the
+                            /// transient stall; WS-level park is a
+                            /// Phase B follow-up.
                             host_api_failures_.store(
                                 0, std::memory_order_relaxed);
                         } else {
