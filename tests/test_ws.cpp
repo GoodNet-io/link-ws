@@ -397,7 +397,7 @@ TEST(WsLink, LoopbackHandshakeAndPayloadRoundTrip) {
     server->shutdown();
 }
 
-// ── shutdown discipline — link.md §9 sync release ────────────────────────
+// ── shutdown discipline — link.en.md §9 sync release ────────────────────────
 
 TEST(WsLink_Shutdown, IsIdempotent) {
     /// Multiple `shutdown()` calls must be safe.
@@ -450,7 +450,7 @@ TEST(WsLink_Shutdown, SynchronousNotifyDisconnect) {
     EXPECT_EQ(harness.disconnects.size(), connects)
         << "WsLink::shutdown() must fire notify_disconnect "
            "synchronously for every live session before the carrier "
-           "is released (link.md §9).";
+           "is released (link.en.md §9).";
 }
 
 // ── backpressure §3.1 — control-reply per-frame size discipline ──────────

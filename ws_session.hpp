@@ -241,7 +241,7 @@ public:
         if (!t) return;
         auto frame = wire::build_close_frame(
             mode_ == Mode::Client, make_mask_seed());
-        /// Per backpressure.md §3.1: a queued close frame past the
+        /// Per backpressure.en.md §3.1: a queued close frame past the
         /// per-conn hard cap is dropped; the carrier disconnect below
         /// still carries the closure regardless of whether the wire-
         /// level frame went out.
@@ -447,7 +447,7 @@ private:
                         std::span<const std::uint8_t>(
                             payload.data(), payload.size()),
                         mode_ == Mode::Client, make_mask_seed());
-                    /// Per backpressure.md §3.1: a control flood is
+                    /// Per backpressure.en.md §3.1: a control flood is
                     /// abuse, not production traffic. If echoing the
                     /// pong would push beyond the per-frame hard cap,
                     /// disconnect rather than amplify the buffer.
