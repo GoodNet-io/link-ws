@@ -331,7 +331,7 @@ inline std::vector<std::uint8_t> build_pong_frame(
 
 /// Build a ping frame carrying @p payload (RFC 6455 §5.5.2).
 /// Production code does not emit pings — the helper exists so the
-/// regression suite for `backpressure.md` §3.1 can simulate a
+/// regression suite for `backpressure.en.md` §3.1 can simulate a
 /// peer-initiated ping flood on the receive path.
 inline std::vector<std::uint8_t> build_ping_frame(
     std::span<const std::uint8_t> payload,

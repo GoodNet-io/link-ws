@@ -223,7 +223,7 @@ public:
     }
 
     /// Bypass framing — push raw bytes through the carrier as-is.
-    /// Used only by the test harness for `backpressure.md` §3.1.
+    /// Used only by the test harness for `backpressure.en.md` §3.1.
     [[nodiscard]] gn_result_t send_raw(
         std::span<const std::uint8_t> bytes) {
         if (phase_ == Phase::Closed) return GN_ERR_NOT_FOUND;
@@ -401,8 +401,9 @@ private:
                             /// pause / resume semantics. The carrier
                             /// underneath (TCP or TLS via the IPC
                             /// stalled-recv park) already absorbs the
-                            /// transient stall; WS-level park is a
-                            /// Phase B follow-up.
+                            /// transient stall; a future WS-level
+                            /// park that survives multi-frame stalls
+                            /// remains an open extension.
                             host_api_failures_.store(
                                 0, std::memory_order_relaxed);
                         } else {

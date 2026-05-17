@@ -61,7 +61,7 @@ public:
     WsLink& operator=(const WsLink&) = delete;
 
     /// Bind a listening WebSocket endpoint. URI form is
-    /// `ws://host:port[/path]` per `uri.md`. The path component is
+    /// `ws://host:port[/path]` per `uri.en.md`. The path component is
     /// accepted but not routed — every upgrade succeeds regardless
     /// of resource path; refining that requires an HTTP routing
     /// layer that v1 explicitly does not own.
@@ -111,7 +111,7 @@ public:
     [[nodiscard]] static gn_link_caps_t capabilities() noexcept;
 
     /// Override the per-connection hard cap after `set_host_api` —
-    /// the regression suite for `backpressure.md` §3.1 needs a tiny
+    /// the regression suite for `backpressure.en.md` §3.1 needs a tiny
     /// cap to exercise the control-reply abuse path inside a unit
     /// test. Production callers configure the cap through
     /// `gn_limits_t::pending_queue_bytes_hard`.
@@ -120,7 +120,7 @@ public:
     /// Simulate a peer-initiated frame on @p conn by pushing @p bytes
     /// straight through the L1 carrier. The receive path of the peer's
     /// session parses and processes the frame as if it arrived over
-    /// the wire. Used by the regression suite for `backpressure.md`
+    /// the wire. Used by the regression suite for `backpressure.en.md`
     /// §3.1.
     [[nodiscard]] gn_result_t send_raw_for_test(
         gn_conn_id_t conn,
@@ -207,7 +207,7 @@ private:
     /// `notify_disconnect` on the caller thread so each
     /// `notify_connect` maps to exactly one caller-thread
     /// `notify_disconnect` even when a worker already emitted the
-    /// release on its own thread (`link.md` §9 step 3).
+    /// release on its own thread (`link.en.md` §9 step 3).
     std::vector<gn_conn_id_t> published_ids_;
 
     std::atomic<std::uint64_t> bytes_in_{0};
@@ -216,7 +216,7 @@ private:
     std::atomic<std::uint64_t> frames_out_{0};
 
     /// Per-connection hard cap on outbound WS frame size — the
-    /// `backpressure.md` §3.1 control-reply abuse protection. With the
+    /// `backpressure.en.md` §3.1 control-reply abuse protection. With the
     /// composer-mode refactor the WS layer no longer owns a write
     /// queue (the carrier does); we still bound a single emitted
     /// frame's size so a peer cannot drive arbitrarily large echoes.

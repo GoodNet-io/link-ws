@@ -411,7 +411,7 @@ TEST(WsLink_Shutdown, IsIdempotent) {
 }
 
 TEST(WsLink_Shutdown, SynchronousNotifyDisconnect) {
-    /// `link.md` §9 — shutdown releases every kernel-observable
+    /// `link.en.md` §9 — shutdown releases every kernel-observable
     /// session before the carrier tear-down. The append-only
     /// `published_ids_` log carries each session through
     /// `notify_disconnect` on the caller thread regardless of
@@ -456,7 +456,7 @@ TEST(WsLink_Shutdown, SynchronousNotifyDisconnect) {
 // ── backpressure §3.1 — control-reply per-frame size discipline ──────────
 
 TEST(WsLink_PingFlood, ServerDisconnectsOnPongFrameOverflow) {
-    /// `backpressure.md` §3.1: a peer flooding pings cannot drive
+    /// `backpressure.en.md` §3.1: a peer flooding pings cannot drive
     /// the server to echo arbitrarily large pongs — the server
     /// disconnects when the next pong frame's size would exceed the
     /// per-conn hard cap. With the composer-mode refactor the WS

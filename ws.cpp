@@ -109,7 +109,7 @@ gn_trust_class_t WsLink::resolve_trust_from_uri(
     /// The carrier's peer URI is the canonical L1 form,
     /// `tcp://host:port` / `tls://host:port`. Strip the scheme prefix
     /// and check for loopback literals; everything else is
-    /// `Untrusted` per `link.md` §3 — trust upgrades to `Peer` after
+    /// `Untrusted` per `link.en.md` §3 — trust upgrades to `Peer` after
     /// Noise completes above us.
     const auto colon = peer_uri.find("://");
     const auto host_start = colon == std::string_view::npos
