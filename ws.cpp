@@ -398,7 +398,8 @@ void WsLink::shutdown() {
     /// `shutdown_=true`, and bail — the drain below then carries the
     /// kernel-observable release on the caller thread either way. The
     /// kernel resolves the resulting double-emit through
-    /// `GN_ERR_NOT_FOUND` (`host_api_builder.cpp` thunk_notify_disconnect).
+    /// `GN_ERR_NOT_FOUND` (see
+    /// `core/kernel/host_api/notifications.cpp::notify_disconnect`).
     bool first_call = false;
     std::vector<gn_conn_id_t> ids_to_emit;
     std::vector<std::shared_ptr<Session>> sessions_to_close;
