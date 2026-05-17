@@ -303,9 +303,9 @@ TEST(WsLink_Uri, RejectsBareScheme) {
 // NOLINTBEGIN(bugprone-unchecked-optional-access)
 TEST(WsLink_Uri, HostAuthorityBracketsV6) {
     /// RFC 7230 §5.4: an IPv6 literal in the HTTP `Host:` header
-    /// must be bracketed. The WS connect path used to emit
-    /// `Host: ::1:9000`, which strict servers (nginx, Caddy)
-    /// reject. `ParsedUri::host_authority()` is the choke point.
+    /// must be bracketed; strict servers (nginx, Caddy) reject the
+    /// unbracketed form. `ParsedUri::host_authority()` is the
+    /// choke point.
     /// gtest `ASSERT_TRUE(...has_value())` short-circuits the
     /// dereference but tidy can't model the abort, so the same
     /// NOLINT pattern as `tests/unit/util/test_uri.cpp` and
