@@ -1,6 +1,19 @@
 # WebSocket link plugin unit tests — MIT.
 include(GoogleTest)
 
+# The carrier-mode tests need the in-tree `goodnet_tcp_objects` (and
+# optionally `goodnet_tls_objects`) OBJECT libraries to stand up a
+# real link surface for the WS framing roundtrip. In the standalone
+# plugin flake those sibling targets are not present, so the test
+# binary is skipped — the plugin .so still builds clean. The kernel
+# monorepo build always has both targets and runs the full suite.
+if(NOT TARGET goodnet_tcp_objects)
+    message(STATUS
+        "ws/tests: skipped (goodnet_tcp_objects target missing — "
+        "standalone WS flake build; tests run in the kernel monorepo)")
+    return()
+endif()
+
 set(_ws_test_sources test_ws.cpp test_ws_conformance.cpp)
 set(_ws_test_carriers goodnet_tcp_objects)
 # `wss://` exercises a TLS carrier layered on top of the TCP carrier —
