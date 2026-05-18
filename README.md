@@ -30,6 +30,13 @@ Manifest entry pins the SHA-256 digest; `gn_plugin_init` registers
 the `ws` scheme. See `docs/install.en.md` and
 `docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
+## RFC coverage
+
+| RFC | Title | Status |
+|---|---|---|
+| [RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455) | The WebSocket Protocol | full — handshake, masking, ping/pong, close, fragmentation reassembly per §5.4 (max 16 MiB reassembled message; single-frame cap `kMaxFramePayload = 64 KiB`) |
+| [RFC 7692](https://datatracker.ietf.org/doc/html/rfc7692) | Compression Extensions for WebSocket (permessage-deflate) | **not implemented** — a client offering `Sec-WebSocket-Extensions: permessage-deflate` in handshake gets a response with no `Sec-WebSocket-Extensions` echo, so the extension never activates and the conn falls back to uncompressed frames per RFC 7692 §5.1 |
+
 ## Contract
 
 - Kernel-side link contract: `docs/contracts/link.en.md`
