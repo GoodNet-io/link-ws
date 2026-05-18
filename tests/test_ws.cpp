@@ -254,6 +254,35 @@ TEST(WsWire, MaskedPayloadRoundTrip) {
     EXPECT_EQ(received, payload);
 }
 
+TEST(WsWire, ApplyMaskHandlesEdgeSizes) {
+    /// The 64-bit-word inner loop processes 8 bytes per iteration;
+    /// the tail loop catches sizes 0–7. Cover every boundary so a
+    /// future optimisation cannot silently break short payloads,
+    /// the off-by-multiple-of-8 case, or empty input.
+    const std::uint8_t mask[4] = {0x01u, 0x02u, 0x03u, 0x04u};
+    for (std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{4},
+                           std::size_t{7}, std::size_t{8}, std::size_t{9},
+                           std::size_t{15}, std::size_t{16}, std::size_t{17},
+                           std::size_t{63}, std::size_t{64}, std::size_t{65}}) {
+        std::vector<std::uint8_t> orig(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            orig[i] = static_cast<std::uint8_t>(i * 7u);
+        }
+        std::vector<std::uint8_t> buf = orig;
+        ws_wire::apply_mask(
+            std::span<std::uint8_t>(buf.data(), buf.size()), mask);
+        /// Verify each byte XORed with the right mask byte.
+        for (std::size_t i = 0; i < n; ++i) {
+            EXPECT_EQ(buf[i], static_cast<std::uint8_t>(orig[i] ^ mask[i & 3u]))
+                << "n=" << n << " i=" << i;
+        }
+        /// Round-trip: a second apply restores the original.
+        ws_wire::apply_mask(
+            std::span<std::uint8_t>(buf.data(), buf.size()), mask);
+        EXPECT_EQ(buf, orig) << "round-trip n=" << n;
+    }
+}
+
 TEST(WsWire, HandshakeAcceptKnownVector) {
     /// RFC 6455 §1.3 known-answer test: the canonical example from
     /// the spec must produce the canonical accept value.
