@@ -567,3 +567,163 @@ TEST(WsLink_Capabilities, AdvertisesStreamReliableOrdered) {
     EXPECT_GT(caps.max_payload, 0u)
         << "WS caps should declare the per-frame payload ceiling";
 }
+
+// ── RFC 6455 §5.4 fragmentation reassembly ───────────────────────────────
+
+namespace {
+
+/// Build one fragment frame by hand. `wire::build_binary_frame` always
+/// sets FIN=1 and opcode=0x2, so the spec's fragmented-message shape
+/// (first fragment FIN=0 / binary, middle FIN=0 / continuation, last
+/// FIN=1 / continuation) needs a small builder. Client→server frames
+/// MUST be masked per RFC 6455 §5.1 — that path mirrors the server's
+/// production receive path including the apply_mask hot loop.
+std::vector<std::uint8_t> build_fragment(
+    std::span<const std::uint8_t> payload,
+    bool fin, std::uint8_t opcode,
+    bool mask, std::uint32_t mask_seed) {
+    std::vector<std::uint8_t> out;
+    out.reserve(payload.size() + 14);
+    /// Byte 0: FIN bit + opcode (4-bit).
+    out.push_back(static_cast<std::uint8_t>(
+        (fin ? 0x80U : 0x00U) |
+        static_cast<std::uint8_t>(opcode & 0x0fU)));
+    const std::uint8_t mask_bit =
+        mask ? static_cast<std::uint8_t>(0x80U) : std::uint8_t{0};
+    if (payload.size() < 126U) {
+        out.push_back(static_cast<std::uint8_t>(
+            mask_bit | static_cast<std::uint8_t>(payload.size())));
+    } else if (payload.size() <= 0xffffU) {
+        out.push_back(static_cast<std::uint8_t>(mask_bit | 126U));
+        out.push_back(static_cast<std::uint8_t>(payload.size() >> 8U));
+        out.push_back(static_cast<std::uint8_t>(payload.size()));
+    } else {
+        out.push_back(static_cast<std::uint8_t>(mask_bit | 127U));
+        const std::uint64_t n = payload.size();
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.push_back(static_cast<std::uint8_t>(n >> shift));
+        }
+    }
+    if (mask) {
+        const std::uint8_t mk[4] = {
+            static_cast<std::uint8_t>(mask_seed >> 24),
+            static_cast<std::uint8_t>(mask_seed >> 16),
+            static_cast<std::uint8_t>(mask_seed >>  8),
+            static_cast<std::uint8_t>(mask_seed),
+        };
+        out.push_back(mk[0]);
+        out.push_back(mk[1]);
+        out.push_back(mk[2]);
+        out.push_back(mk[3]);
+        for (std::size_t i = 0; i < payload.size(); ++i) {
+            out.push_back(
+                static_cast<std::uint8_t>(payload[i] ^ mk[i & 3U]));
+        }
+    } else {
+        for (auto b : payload) out.push_back(b);
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(WsLink_Fragmentation, MaskedThreeFragmentReassemblyOverThreshold) {
+    /// RFC 6455 §5.4 — a 70 KiB payload split across three fragments
+    /// (FIN=0 binary, FIN=0 continuation, FIN=1 continuation), each
+    /// masked separately as the spec requires for client→server
+    /// frames. After reassembly the server's upper layer must observe
+    /// the original payload byte-for-byte in one notify_inbound_bytes
+    /// delivery. The size deliberately straddles the 65 KiB single-
+    /// frame ceiling so a regression that silently dropped one
+    /// fragment would surface as a short delivery.
+    WsHarness harness;
+    auto api = harness.make_api();
+
+    auto server = std::make_shared<gn::link::ws::WsLink>();
+    auto client = std::make_shared<gn::link::ws::WsLink>();
+    server->set_host_api(&api);
+    client->set_host_api(&api);
+
+    ASSERT_EQ(server->listen("ws://127.0.0.1:0/"), GN_OK);
+    const auto port = server->listen_port();
+    ASSERT_GT(port, 0u);
+    const std::string uri =
+        "ws://127.0.0.1:" + std::to_string(port) + "/";
+    ASSERT_EQ(client->connect(uri), GN_OK);
+
+    ASSERT_TRUE(wait_for([&]() {
+        std::lock_guard lk(harness.mu);
+        return harness.connects.size() >= 2;
+    }));
+
+    /// The injected fragments are masked frames, so the recipient
+    /// must be the server (mode = Server unmasks; client refuses
+    /// masked frames). Use the client's conn-id since on the shared
+    /// harness the two transports share IDs and send_raw_for_test
+    /// pushes through the carrier toward the peer.
+    gn_conn_id_t client_conn = 0;
+    {
+        std::lock_guard lk(harness.mu);
+        for (std::size_t i = 0; i < harness.roles.size(); ++i) {
+            if (harness.roles[i] == GN_ROLE_INITIATOR) {
+                client_conn = harness.connects[i];
+                break;
+            }
+        }
+    }
+    ASSERT_NE(client_conn, 0u);
+
+    /// 70 KiB total > the 65 KiB single-frame ceiling. Three fragments
+    /// of ~23 KiB each force the reassembly path. Filled with a
+    /// deterministic pattern so a wrong byte after reassembly stands
+    /// out under a vector compare.
+    constexpr std::size_t total = 70U * 1024U;
+    std::vector<std::uint8_t> original(total);
+    for (std::size_t i = 0; i < total; ++i) {
+        original[i] = static_cast<std::uint8_t>((i * 31U + 7U) & 0xffU);
+    }
+    const std::size_t third = total / 3U;
+    std::span<const std::uint8_t> p1(original.data(),             third);
+    std::span<const std::uint8_t> p2(original.data() + third,     third);
+    std::span<const std::uint8_t> p3(original.data() + 2U * third,
+                                      total - 2U * third);
+
+    /// Each fragment uses a distinct mask key — RFC §5.3 lets the
+    /// sender pick a fresh 32-bit key per frame.
+    auto f1 = build_fragment(p1, /*fin=*/false, /*opcode=*/0x2,
+                             /*mask=*/true, 0xCAFEBABEu);
+    auto f2 = build_fragment(p2, /*fin=*/false, /*opcode=*/0x0,
+                             /*mask=*/true, 0x12345678u);
+    auto f3 = build_fragment(p3, /*fin=*/true,  /*opcode=*/0x0,
+                             /*mask=*/true, 0xDEADBEEFu);
+
+    /// Push the three fragments through the carrier as raw bytes.
+    /// The server's session reassembles and the harness records the
+    /// merged delivery in `inbound`.
+    ASSERT_EQ(client->send_raw_for_test(client_conn,
+        std::span<const std::uint8_t>(f1)), GN_OK);
+    ASSERT_EQ(client->send_raw_for_test(client_conn,
+        std::span<const std::uint8_t>(f2)), GN_OK);
+    ASSERT_EQ(client->send_raw_for_test(client_conn,
+        std::span<const std::uint8_t>(f3)), GN_OK);
+
+    ASSERT_TRUE(wait_for([&]() {
+        std::lock_guard lk(harness.mu);
+        return !harness.inbound.empty() &&
+               harness.inbound.front().size() == total;
+    }, std::chrono::seconds{10}));
+    {
+        std::lock_guard lk(harness.mu);
+        ASSERT_FALSE(harness.inbound.empty());
+        EXPECT_EQ(harness.inbound.front().size(), total);
+        EXPECT_EQ(harness.inbound.front(), original)
+            << "RFC 6455 §5.4 reassembly must hand the merged payload "
+               "to the upper layer byte-for-byte equal to the source.";
+        EXPECT_EQ(harness.disconnects.size(), 0u)
+            << "Three-fragment reassembly must not trip the protocol "
+               "error path.";
+    }
+
+    client->shutdown();
+    server->shutdown();
+}

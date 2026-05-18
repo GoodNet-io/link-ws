@@ -369,23 +369,54 @@ private:
             t->frames_in_.fetch_add(1, std::memory_order_relaxed);
 
             switch (header->opcode) {
-                case 0x0:  // continuation
-                case 0x1:  // text — treated as binary at the byte level
-                case 0x2:  // binary
-                    if (!header->fin) {
-                        /// Fragmented WS messages are out of scope —
-                        /// the kernel's protocol layer caps frames
-                        /// anyway, so legitimate peers stay under
-                        /// one frame. Fragment support is a planned
-                        /// extension.
+                case 0x0:    // continuation
+                case 0x1:    // text — treated as binary at the byte level
+                case 0x2: {  // binary
+                    /// RFC 6455 §5.4 reassembly. A 0x1 / 0x2 opcode
+                    /// with FIN=0 starts a fragmented message; further
+                    /// fragments arrive as 0x0 (continuation), the
+                    /// final one with FIN=1. A 0x0 outside an in-
+                    /// progress message and a 0x1 / 0x2 mid-stream are
+                    /// both protocol errors.
+                    const bool is_cont = header->opcode == 0x0;
+                    if (is_cont && !reassembling_) { fail(); return; }
+                    if (!is_cont && reassembling_) { fail(); return; }
+                    if (kMaxReassembledMessage != 0 &&
+                        fragment_buf_.size() + payload.size() >
+                            kMaxReassembledMessage) {
                         fail();
                         return;
+                    }
+                    if (!header->fin) {
+                        /// Buffer this fragment, wait for FIN. The
+                        /// first fragment carries the application
+                        /// opcode (text/binary) — both flow up to the
+                        /// kernel as raw bytes anyway, so we only need
+                        /// the in-progress flag, not the opcode value.
+                        fragment_buf_.insert(
+                            fragment_buf_.end(),
+                            payload.begin(), payload.end());
+                        reassembling_ = true;
+                        break;
+                    }
+                    /// FIN=1 path. If reassembly was in progress this
+                    /// is the final fragment — append and deliver the
+                    /// merged buffer; otherwise this is a single-frame
+                    /// message and `payload` is already complete.
+                    const std::uint8_t* deliver_ptr = payload.data();
+                    std::size_t          deliver_n  = payload.size();
+                    if (reassembling_) {
+                        fragment_buf_.insert(
+                            fragment_buf_.end(),
+                            payload.begin(), payload.end());
+                        deliver_ptr = fragment_buf_.data();
+                        deliver_n   = fragment_buf_.size();
                     }
                     if (t->api_ && t->api_->notify_inbound_bytes) {
                         const gn_result_t rc =
                             t->api_->notify_inbound_bytes(
                                 t->api_->host_ctx, conn_id_,
-                                payload.data(), payload.size());
+                                deliver_ptr, deliver_n);
                         if (rc == GN_OK) {
                             host_api_failures_.store(
                                 0, std::memory_order_relaxed);
@@ -418,7 +449,15 @@ private:
                             }
                         }
                     }
+                    /// Reset reassembly state. `clear()` keeps the
+                    /// vector's capacity so the next fragmented
+                    /// message reuses the allocation.
+                    if (reassembling_) {
+                        fragment_buf_.clear();
+                        reassembling_ = false;
+                    }
                     break;
+                }
                 case 0x8: {  // close
                     /// Mirror back, then tear down. Idempotent if we
                     /// already initiated close.
@@ -505,6 +544,14 @@ public:
     gn_trust_class_t    trust_ = GN_TRUST_UNTRUSTED;
 
 private:
+    /// Ceiling for a single RFC 6455 §5.4 reassembled message. 16 MiB
+    /// is well past the protocol-layer envelope cap so the kernel-
+    /// side flow control still bounds the buffer in practice; the
+    /// extra ceiling here defends the per-conn memory footprint
+    /// against a peer that splits a multi-gigabyte payload across
+    /// continuation frames.
+    static constexpr std::size_t kMaxReassembledMessage = 16U * 1024U * 1024U;
+
     std::weak_ptr<WsLink>     transport_;
     gn_conn_id_t              l1_id_   = GN_INVALID_ID;
     Mode                      mode_    = Mode::Server;
@@ -514,6 +561,11 @@ private:
     std::vector<std::uint8_t> frame_buf_;
     std::string               nonce_;
     std::atomic<std::uint32_t> host_api_failures_{0};
+    /// RFC 6455 §5.4 reassembly buffer. Populated on FIN=0 data
+    /// frames; flushed on the FIN=1 final fragment together with
+    /// `reassembling_`.
+    std::vector<std::uint8_t> fragment_buf_;
+    bool                      reassembling_ = false;
 };
 
 }  // namespace gn::link::ws
