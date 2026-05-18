@@ -373,9 +373,11 @@ private:
                 case 0x1:  // text — treated as binary at the byte level
                 case 0x2:  // binary
                     if (!header->fin) {
-                        /// Defer fragmented messages until v1.1; the
-                        /// kernel's protocol layer caps frames anyway
-                        /// so legitimate peers stay under one frame.
+                        /// Fragmented WS messages are out of scope —
+                        /// the kernel's protocol layer caps frames
+                        /// anyway, so legitimate peers stay under
+                        /// one frame. Fragment support is a planned
+                        /// extension.
                         fail();
                         return;
                     }
