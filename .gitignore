@@ -41,3 +41,6 @@ result
 result-*
 .direnv/
 .cache/
+
+# Claude Code session context — not plugin code
+.claude/
